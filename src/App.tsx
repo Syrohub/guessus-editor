@@ -10,6 +10,8 @@ interface Word {
   es: string
   ua: string
   intensity: number
+  _idx?: number
+  _selected?: boolean
 }
 
 interface CategoryMeta {
@@ -30,12 +32,6 @@ type LegacyWordDatabase = Record<Language, Partial<Record<string, string[]>>>
 interface VersionInfo {
   version: string
   updatedAt: string
-}
-
-interface DuplicateInfo {
-  word: string
-  lang: Language
-  locations: { category: string; index: number }[]
 }
 
 // Constants
@@ -137,6 +133,80 @@ function convertNewToLegacy(data: DictionaryData): LegacyWordDatabase {
   return legacy
 }
 
+// Cache helpers
+const CACHE_KEY_ADULT = 'guessus_editor_adult'
+const CACHE_KEY_FAMILY = 'guessus_editor_family'
+
+function saveToCache(variant: DictionaryVariant, data: DictionaryData) {
+  const key = variant === 'adult' ? CACHE_KEY_ADULT : CACHE_KEY_FAMILY
+  localStorage.setItem(key, JSON.stringify(data))
+}
+
+function loadFromCache(variant: DictionaryVariant): DictionaryData | null {
+  const key = variant === 'adult' ? CACHE_KEY_ADULT : CACHE_KEY_FAMILY
+  const cached = localStorage.getItem(key)
+  if (cached) {
+    try { return JSON.parse(cached) } catch { return null }
+  }
+  return null
+}
+
+function clearCache(variant: DictionaryVariant) {
+  const key = variant === 'adult' ? CACHE_KEY_ADULT : CACHE_KEY_FAMILY
+  localStorage.removeItem(key)
+}
+
+// OpenAI API
+async function generateWordsWithAI(
+  apiKey: string,
+  category: string,
+  intensityMin: number,
+  intensityMax: number,
+  count: number,
+  variant: DictionaryVariant
+): Promise<Word[]> {
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [{
+        role: 'system',
+        content: `You are a word generator for a party guessing game. Generate words for the "${category}" category.
+The game is ${variant === 'adult' ? 'for adults (18+)' : 'family-friendly'}.
+Intensity scale: 1=innocent, 5=spicy, 10=extreme taboo.
+Generate words with intensity between ${intensityMin} and ${intensityMax}.
+Return ONLY a JSON array of objects with format:
+[{"ru":"Russian word","en":"English equivalent","es":"Spanish equivalent","ua":"Ukrainian equivalent","intensity":number}]
+Important: translations should be SEMANTIC equivalents (same meaning in that culture), not literal translations.
+Generate exactly ${count} unique, interesting words good for a guessing game.`
+      }, {
+        role: 'user',
+        content: `Generate ${count} words for "${category}" category, intensity ${intensityMin}-${intensityMax}. Return only JSON array.`
+      }],
+      temperature: 0.9,
+      max_tokens: 4000
+    })
+  })
+  
+  if (!response.ok) {
+    const err = await response.json()
+    throw new Error(err.error?.message || 'API error')
+  }
+  
+  const data = await response.json()
+  const content = data.choices[0]?.message?.content || '[]'
+  
+  // Extract JSON from response
+  const jsonMatch = content.match(/\[[\s\S]*\]/)
+  if (!jsonMatch) throw new Error('No JSON in response')
+  
+  return JSON.parse(jsonMatch[0])
+}
+
 function App() {
   const [variant, setVariant] = useState<DictionaryVariant>('adult')
   const [data, setData] = useState<DictionaryData | null>(null)
@@ -159,19 +229,52 @@ function App() {
   const [moveToCategory, setMoveToCategory] = useState<string | null>(null)
   const [selectedWords, setSelectedWords] = useState<Set<number>>(new Set())
   
+  // AI Generation
+  const [openaiKey, setOpenaiKey] = useState(() => localStorage.getItem('openai_key') || '')
+  const [generating, setGenerating] = useState(false)
+  const [generatedWords, setGeneratedWords] = useState<Word[]>([])
+  const [generatedSelection, setGeneratedSelection] = useState<Set<number>>(new Set())
+  
   // GitHub
   const [githubToken, setGithubToken] = useState(() => localStorage.getItem('github_token') || '')
   const [publishing, setPublishing] = useState(false)
   const [publishOpen, setPublishOpen] = useState(false)
 
-  // Load dictionary
-  useEffect(() => { loadDictionary() }, [variant])
+  // Load dictionary - first from cache, then from GitHub
+  useEffect(() => {
+    const cached = loadFromCache(variant)
+    if (cached) {
+      setData(cached)
+      setLoading(false)
+      // Still load version from GitHub
+      loadVersion()
+    } else {
+      loadDictionary()
+    }
+  }, [variant])
+
   useEffect(() => {
     const cats = variant === 'adult' ? DEFAULT_ADULT_CATEGORIES : DEFAULT_FAMILY_CATEGORIES
     setSelectedCategory(cats[0].id)
   }, [variant])
 
-  const loadDictionary = async () => {
+  // Save to cache whenever data changes
+  useEffect(() => {
+    if (data && hasChanges) {
+      saveToCache(variant, data)
+    }
+  }, [data, hasChanges, variant])
+
+  const loadVersion = async () => {
+    try {
+      const versionFile = variant === 'adult' ? 'version-adult.json' : 'version.json'
+      const res = await fetch(`${GITHUB_RAW_BASE}/${versionFile}?t=${Date.now()}`)
+      if (res.ok) setVersion(await res.json())
+    } catch {}
+  }
+
+  const loadDictionary = async (forceRefresh = false) => {
+    if (forceRefresh) clearCache(variant)
     setLoading(true)
     try {
       const wordsFile = variant === 'adult' ? 'words-adult.json' : 'words.json'
@@ -183,9 +286,11 @@ function App() {
       if (wordsRes.ok && versionRes.ok) {
         const legacy = await wordsRes.json()
         const ver = await versionRes.json()
-        setData(convertLegacyToNew(legacy, variant))
+        const newData = convertLegacyToNew(legacy, variant)
+        setData(newData)
         setVersion(ver)
         setHasChanges(false)
+        saveToCache(variant, newData)
       }
     } catch (e) { console.error(e) }
     finally { setLoading(false) }
@@ -211,19 +316,25 @@ function App() {
   // Stats
   const stats = useMemo(() => {
     if (!data) return null
-    let total = 0
+    let total = 0, missing = 0
     const byLang = { ru: 0, en: 0, es: 0, ua: 0 }
     Object.values(data.words).forEach(words => {
-      words.forEach(w => { total++; if (w.ru) byLang.ru++; if (w.en) byLang.en++; if (w.es) byLang.es++; if (w.ua) byLang.ua++ })
+      words.forEach(w => {
+        total++
+        if (w.ru) byLang.ru++
+        if (w.en) byLang.en++; else if (w.ru) missing++
+        if (w.es) byLang.es++; else if (w.ru) missing++
+        if (w.ua) byLang.ua++; else if (w.ru) missing++
+      })
     })
-    return { total, byLang }
+    return { total, byLang, missing }
   }, [data])
 
-  // Find duplicates
-  const duplicates = useMemo((): DuplicateInfo[] => {
+  // Find duplicates across ALL categories
+  const duplicates = useMemo(() => {
     if (!data) return []
-    const found: DuplicateInfo[] = []
-    const seen: Record<Language, Map<string, { category: string; index: number }[]>> = {
+    const found: { word: string; lang: Language; locations: { cat: string; idx: number }[] }[] = []
+    const seen: Record<Language, Map<string, { cat: string; idx: number }[]>> = {
       ru: new Map(), en: new Map(), es: new Map(), ua: new Map()
     }
     
@@ -231,10 +342,10 @@ function App() {
       const words = data.words[cat.id] || []
       words.forEach((w, idx) => {
         LANGUAGES.forEach(l => {
-          const val = w[l.code]?.toLowerCase()
+          const val = w[l.code]?.toLowerCase().trim()
           if (val) {
             if (!seen[l.code].has(val)) seen[l.code].set(val, [])
-            seen[l.code].get(val)!.push({ category: cat.id, index: idx })
+            seen[l.code].get(val)!.push({ cat: cat.id, idx })
           }
         })
       })
@@ -249,19 +360,6 @@ function App() {
     })
     
     return found
-  }, [data])
-
-  // Missing translations count
-  const missingTranslations = useMemo(() => {
-    if (!data) return 0
-    let count = 0
-    Object.values(data.words).forEach(words => {
-      words.forEach(w => {
-        const hasRu = !!w.ru
-        if (hasRu && (!w.en || !w.es || !w.ua)) count++
-      })
-    })
-    return count
   }, [data])
 
   // Actions
@@ -292,6 +390,15 @@ function App() {
     setHasChanges(true)
   }
 
+  const handleBulkDelete = () => {
+    if (!data || selectedWords.size === 0) return
+    if (!confirm(`Удалить ${selectedWords.size} слов?`)) return
+    const words = (data.words[selectedCategory] || []).filter((_, i) => !selectedWords.has(i))
+    setData({ ...data, words: { ...data.words, [selectedCategory]: words } })
+    setSelectedWords(new Set())
+    setHasChanges(true)
+  }
+
   const startEdit = (wordIdx: number, field: keyof Word) => {
     const word = currentWords[wordIdx]
     setEditingCell({ wordIdx, field })
@@ -301,7 +408,7 @@ function App() {
   const saveEdit = () => {
     if (!editingCell || !data) return
     const word = currentWords[editingCell.wordIdx]
-    const actualIdx = word._idx
+    const actualIdx = word._idx!
     const words = [...(data.words[selectedCategory] || [])]
     const newValue = editingCell.field === 'intensity' ? Math.min(10, Math.max(1, Number(editValue) || 5)) : editValue
     words[actualIdx] = { ...words[actualIdx], [editingCell.field]: newValue }
@@ -317,20 +424,11 @@ function App() {
     const targetWords = [...(data.words[targetCat] || [])]
     const toMove: Word[] = []
     const remaining: Word[] = []
-    
     sourceWords.forEach((w, i) => {
       if (selectedWords.has(i)) toMove.push(w)
       else remaining.push(w)
     })
-    
-    setData({
-      ...data,
-      words: {
-        ...data.words,
-        [selectedCategory]: remaining,
-        [targetCat]: [...targetWords, ...toMove]
-      }
-    })
+    setData({ ...data, words: { ...data.words, [selectedCategory]: remaining, [targetCat]: [...targetWords, ...toMove] } })
     setSelectedWords(new Set())
     setMoveToCategory(null)
     setHasChanges(true)
@@ -339,17 +437,12 @@ function App() {
   const removeDuplicates = () => {
     if (!data || duplicates.length === 0) return
     const newWords = { ...data.words }
-    
-    // For each category, track which indices to remove
     const toRemove: Record<string, Set<number>> = {}
     data.categories.forEach(c => { toRemove[c.id] = new Set() })
     
     duplicates.forEach(dup => {
-      // Keep first occurrence, remove rest
       const [, ...remove] = dup.locations
-      remove.forEach(loc => {
-        toRemove[loc.category].add(loc.index)
-      })
+      remove.forEach(loc => toRemove[loc.cat].add(loc.idx))
     })
     
     data.categories.forEach(cat => {
@@ -360,44 +453,45 @@ function App() {
     setData({ ...data, words: newWords })
     setDuplicatesOpen(false)
     setHasChanges(true)
-    alert(`Удалено ${duplicates.length} дубликатов`)
+    alert(`Удалено дубликатов: ${duplicates.length}`)
   }
 
-  // Copy prompt for AI
-  const copyAddWordsPrompt = () => {
-    const cat = currentCategory
-    if (!cat) return
-    const prompt = `Сгенерируй ${addWordsCount} слов для категории "${cat.name}" (${variant === 'adult' ? 'Adult 18+' : 'Family'}).
-
-Требования:
-- Уровень жести: ${cat.intensityMin}-${cat.intensityMax} из 10
-- Формат: таблица с колонками: RU | EN | ES | UA | Жесть
-- Русский — основной язык, остальные — смысловой эквивалент (не дословный перевод)
-- Слова должны быть интересными для игры в угадывание
-- Не повторяй существующие слова
-
-После генерации запуши в репозиторий guessus-dictionary.`
+  // AI Generation
+  const handleGenerateWords = async () => {
+    if (!openaiKey || !currentCategory) return
+    localStorage.setItem('openai_key', openaiKey)
     
-    navigator.clipboard.writeText(prompt)
-    alert('📋 Промпт скопирован!\n\nВставь его в чат с ботом.')
+    setGenerating(true)
+    try {
+      const words = await generateWordsWithAI(
+        openaiKey,
+        currentCategory.name,
+        currentCategory.intensityMin,
+        currentCategory.intensityMax,
+        addWordsCount,
+        variant
+      )
+      setGeneratedWords(words)
+      setGeneratedSelection(new Set(words.map((_, i) => i))) // All selected by default
+    } catch (err) {
+      alert(`Ошибка: ${err instanceof Error ? err.message : 'Unknown'}`)
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const handleAddGeneratedWords = () => {
+    if (!data || generatedWords.length === 0) return
+    const toAdd = generatedWords.filter((_, i) => generatedSelection.has(i))
+    const existingWords = data.words[selectedCategory] || []
+    setData({
+      ...data,
+      words: { ...data.words, [selectedCategory]: [...existingWords, ...toAdd] }
+    })
+    setGeneratedWords([])
+    setGeneratedSelection(new Set())
     setAddWordsOpen(false)
-  }
-
-  const copyNewCategoryPrompt = () => {
-    const prompt = `Придумай 10 интересных названий категорий для игры ${variant === 'adult' ? 'Adult 18+' : 'Family'}.
-
-Требования:
-- Уровень жести: ${newCatIntensity[0]}-${newCatIntensity[1]} из 10
-- Формат: Emoji + Название (на русском)
-- Категории должны быть интересными для игры в угадывание слов
-- Примеры для жести ${newCatIntensity[0]}-${newCatIntensity[1]}: ${
-  newCatIntensity[1] <= 3 ? 'еда, животные, профессии' :
-  newCatIntensity[1] <= 6 ? 'вечеринки, свидания, алкоголь' :
-  'интим, фетиши, табу'
-}`
-    
-    navigator.clipboard.writeText(prompt)
-    alert('📋 Промпт скопирован!\n\nВставь его в чат с ботом, получи варианты, выбери и создай категорию.')
+    setHasChanges(true)
   }
 
   // Export & Publish
@@ -410,7 +504,7 @@ function App() {
     a.click()
   }
 
-  const saveToken = (t: string) => { setGithubToken(t); localStorage.setItem('github_token', t) }
+  const saveGithubToken = (t: string) => { setGithubToken(t); localStorage.setItem('github_token', t) }
 
   const publishToGithub = async () => {
     if (!data || !githubToken) return
@@ -452,6 +546,7 @@ function App() {
       
       setVersion(newVersionInfo)
       setHasChanges(false)
+      clearCache(variant) // Clear cache after successful publish
       setPublishOpen(false)
       alert(`✅ v${newVersion}`)
     } catch (err) {
@@ -474,29 +569,21 @@ function App() {
               <div className="flex-1">
                 <label className="text-xs text-gray-500">От</label>
                 <input type="range" min={1} max={10} value={newCatIntensity[0]} 
-                  onChange={e => setNewCatIntensity([Number(e.target.value), Math.max(Number(e.target.value), newCatIntensity[1])])}
-                  className="w-full" />
+                  onChange={e => setNewCatIntensity([Number(e.target.value), Math.max(Number(e.target.value), newCatIntensity[1])])} className="w-full" />
                 <div className="text-center font-bold">{newCatIntensity[0]} <span className="text-xs font-normal text-gray-400">{INTENSITY_LABELS[newCatIntensity[0]]}</span></div>
               </div>
               <div className="flex-1">
                 <label className="text-xs text-gray-500">До</label>
                 <input type="range" min={1} max={10} value={newCatIntensity[1]}
-                  onChange={e => setNewCatIntensity([Math.min(newCatIntensity[0], Number(e.target.value)), Number(e.target.value)])}
-                  className="w-full" />
+                  onChange={e => setNewCatIntensity([Math.min(newCatIntensity[0], Number(e.target.value)), Number(e.target.value)])} className="w-full" />
                 <div className="text-center font-bold">{newCatIntensity[1]} <span className="text-xs font-normal text-gray-400">{INTENSITY_LABELS[newCatIntensity[1]]}</span></div>
               </div>
             </div>
           </div>
-          
-          <button onClick={copyNewCategoryPrompt} className="w-full py-3 bg-purple-600 hover:bg-purple-700 rounded font-medium">
-            🎲 Получить 10 вариантов названий от AI
-          </button>
-          
           <div className="border-t border-gray-700 pt-4">
-            <p className="text-sm text-gray-400 mb-2">Или создай вручную:</p>
             <div className="flex gap-2">
-              <input id="manualCatName" placeholder="Название" className="flex-1 px-3 py-2 bg-gray-700 rounded border border-gray-600" />
-              <input id="manualCatEmoji" placeholder="📁" className="w-16 px-3 py-2 bg-gray-700 rounded border border-gray-600 text-center" />
+              <input id="manualCatName" placeholder="Название категории" className="flex-1 px-3 py-2 bg-gray-700 rounded border border-gray-600" />
+              <input id="manualCatEmoji" placeholder="📁" defaultValue="📁" className="w-16 px-3 py-2 bg-gray-700 rounded border border-gray-600 text-center" />
               <button onClick={() => {
                 const name = (document.getElementById('manualCatName') as HTMLInputElement)?.value
                 const emoji = (document.getElementById('manualCatEmoji') as HTMLInputElement)?.value || '📁'
@@ -507,64 +594,115 @@ function App() {
         </div>
       </Modal>
 
-      {/* Add Words Modal */}
-      <Modal isOpen={addWordsOpen} onClose={() => setAddWordsOpen(false)} title="✨ Добавить слова">
+      {/* Add Words Modal with AI Generation */}
+      <Modal isOpen={addWordsOpen} onClose={() => { setAddWordsOpen(false); setGeneratedWords([]); setGeneratedSelection(new Set()) }} title="✨ Добавить слова" wide>
         <div className="space-y-4">
-          <div className="bg-gray-700 rounded p-3">
-            <div className="text-lg font-medium">{currentCategory?.emoji} {currentCategory?.name}</div>
-            <div className="text-sm text-gray-400">Жесть: {currentCategory?.intensityMin}-{currentCategory?.intensityMax}</div>
-          </div>
-          
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Количество слов</label>
-            <div className="flex items-center gap-3">
-              <input type="range" min={5} max={50} step={5} value={addWordsCount}
-                onChange={e => setAddWordsCount(Number(e.target.value))} className="flex-1" />
-              <span className="w-12 text-center font-bold text-xl">{addWordsCount}</span>
+          <div className="bg-gray-700 rounded p-3 flex items-center justify-between">
+            <div>
+              <div className="text-lg font-medium">{currentCategory?.emoji} {currentCategory?.name}</div>
+              <div className="text-sm text-gray-400">Жесть: {currentCategory?.intensityMin}-{currentCategory?.intensityMax}</div>
+            </div>
+            <div className="text-right">
+              <label className="text-xs text-gray-500">Количество</label>
+              <input type="number" min={5} max={50} value={addWordsCount} onChange={e => setAddWordsCount(Number(e.target.value))}
+                className="w-20 px-2 py-1 bg-gray-600 rounded ml-2 text-center" />
             </div>
           </div>
           
-          <button onClick={copyAddWordsPrompt} className="w-full py-3 bg-green-600 hover:bg-green-700 rounded font-medium">
-            📋 Скопировать запрос для AI
-          </button>
+          {/* OpenAI Key */}
+          <div>
+            <label className="text-xs text-gray-500">OpenAI API Key</label>
+            <input type="password" value={openaiKey} onChange={e => setOpenaiKey(e.target.value)}
+              placeholder="sk-..." className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 mt-1" />
+          </div>
           
-          <p className="text-xs text-gray-500 text-center">
-            После копирования вставь запрос в чат с ботом.<br/>
-            Бот сгенерирует слова и добавит их в репозиторий.<br/>
-            Затем нажми "🔄 Обновить" чтобы увидеть новые слова.
-          </p>
+          {/* Generate Button */}
+          {generatedWords.length === 0 ? (
+            <button onClick={handleGenerateWords} disabled={!openaiKey || generating}
+              className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded font-medium">
+              {generating ? '⏳ Генерация...' : `🤖 Сгенерировать ${addWordsCount} слов`}
+            </button>
+          ) : (
+            <>
+              {/* Generated words preview */}
+              <div className="max-h-64 overflow-y-auto border border-gray-600 rounded">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-700 sticky top-0">
+                    <tr>
+                      <th className="py-1 px-2 w-8">
+                        <input type="checkbox" checked={generatedSelection.size === generatedWords.length}
+                          onChange={e => setGeneratedSelection(e.target.checked ? new Set(generatedWords.map((_, i) => i)) : new Set())} />
+                      </th>
+                      <th className="py-1 px-2 text-left">🇷🇺</th>
+                      <th className="py-1 px-2 text-left">🇺🇸</th>
+                      <th className="py-1 px-2 text-left">🇪🇸</th>
+                      <th className="py-1 px-2 text-left">🇺🇦</th>
+                      <th className="py-1 px-2 w-12">⚖️</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {generatedWords.map((w, i) => (
+                      <tr key={i} className={`border-t border-gray-700 ${generatedSelection.has(i) ? '' : 'opacity-40'}`}>
+                        <td className="py-1 px-2">
+                          <input type="checkbox" checked={generatedSelection.has(i)}
+                            onChange={e => {
+                              const newSet = new Set(generatedSelection)
+                              if (e.target.checked) newSet.add(i); else newSet.delete(i)
+                              setGeneratedSelection(newSet)
+                            }} />
+                        </td>
+                        <td className="py-1 px-2">{w.ru}</td>
+                        <td className="py-1 px-2">{w.en}</td>
+                        <td className="py-1 px-2">{w.es}</td>
+                        <td className="py-1 px-2">{w.ua}</td>
+                        <td className="py-1 px-2 text-center">{w.intensity}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              
+              <div className="flex gap-2">
+                <button onClick={() => { setGeneratedWords([]); setGeneratedSelection(new Set()) }}
+                  className="flex-1 py-2 bg-gray-600 hover:bg-gray-500 rounded">
+                  🔄 Заново
+                </button>
+                <button onClick={handleAddGeneratedWords} disabled={generatedSelection.size === 0}
+                  className="flex-1 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded font-medium">
+                  ✅ Добавить ({generatedSelection.size})
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </Modal>
 
       {/* Duplicates Modal */}
       <Modal isOpen={duplicatesOpen} onClose={() => setDuplicatesOpen(false)} title="⚠️ Дубликаты" wide>
         <div className="space-y-4">
-          <p className="text-gray-400">Найдено {duplicates.length} дубликатов:</p>
+          <p className="text-gray-400">Найдено {duplicates.length} дубликатов во ВСЕХ категориях:</p>
           <div className="max-h-64 overflow-y-auto space-y-2">
-            {duplicates.slice(0, 20).map((d, i) => (
-              <div key={i} className="bg-gray-700 rounded p-2 text-sm">
-                <span className="font-medium">{LANGUAGES.find(l => l.code === d.lang)?.flag} {d.word}</span>
-                <span className="text-gray-400 ml-2">
-                  в: {d.locations.map(l => l.category).join(', ')}
-                </span>
+            {duplicates.slice(0, 30).map((d, i) => (
+              <div key={i} className="bg-gray-700 rounded p-2 text-sm flex items-center justify-between">
+                <span>{LANGUAGES.find(l => l.code === d.lang)?.flag} <strong>{d.word}</strong></span>
+                <span className="text-gray-400 text-xs">в: {d.locations.map(l => l.cat).join(', ')}</span>
               </div>
             ))}
-            {duplicates.length > 20 && <div className="text-gray-500 text-sm">...и ещё {duplicates.length - 20}</div>}
+            {duplicates.length > 30 && <div className="text-gray-500 text-sm text-center">...и ещё {duplicates.length - 30}</div>}
           </div>
           <button onClick={removeDuplicates} className="w-full py-2 bg-red-600 hover:bg-red-700 rounded font-medium">
-            🗑️ Удалить все дубликаты (оставить первое вхождение)
+            🗑️ Удалить все дубликаты (оставить первое)
           </button>
         </div>
       </Modal>
 
       {/* Move to Category Modal */}
-      <Modal isOpen={!!moveToCategory} onClose={() => setMoveToCategory(null)} title="📦 Переместить в категорию">
+      <Modal isOpen={!!moveToCategory} onClose={() => setMoveToCategory(null)} title="📦 Переместить">
         <div className="space-y-2">
-          <p className="text-gray-400 mb-3">Выбрано слов: {selectedWords.size}</p>
           {data?.categories.filter(c => c.id !== selectedCategory).map(cat => (
             <button key={cat.id} onClick={() => moveSelectedToCategory(cat.id)}
               className="w-full py-2 px-3 bg-gray-700 hover:bg-gray-600 rounded text-left">
-              {cat.emoji} {cat.name}
+              {cat.emoji} {cat.name} ({data.words[cat.id]?.length || 0})
             </button>
           ))}
         </div>
@@ -575,7 +713,7 @@ function App() {
         <div className="space-y-4">
           <div>
             <label className="block text-sm text-gray-400 mb-1">GitHub Token</label>
-            <input type="password" value={githubToken} onChange={e => saveToken(e.target.value)}
+            <input type="password" value={githubToken} onChange={e => saveGithubToken(e.target.value)}
               placeholder="ghp_..." className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600" />
           </div>
           <button onClick={publishToGithub} disabled={!githubToken || publishing}
@@ -591,12 +729,12 @@ function App() {
           <div className="flex items-center gap-3">
             <h1 className="text-xl font-bold">🎯 GuessUs Editor</h1>
             {version && <span className="text-sm text-gray-500">v{version.version}</span>}
-            {hasChanges && <span className="text-yellow-400 text-sm animate-pulse">●</span>}
+            {hasChanges && <span className="text-yellow-400 text-sm animate-pulse">● несохранено</span>}
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={loadDictionary} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">🔄</button>
+            <button onClick={() => loadDictionary(true)} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm" title="Загрузить с GitHub (сбросит изменения)">🔄</button>
             <button onClick={exportJson} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">💾</button>
-            <button onClick={() => setPublishOpen(true)} className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded text-sm">📤 Опубликовать</button>
+            <button onClick={() => setPublishOpen(true)} className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded text-sm">📤</button>
           </div>
         </div>
       </header>
@@ -610,7 +748,7 @@ function App() {
             <button onClick={() => setVariant('family')} className={`flex-1 py-1.5 rounded text-sm ${variant === 'family' ? 'bg-green-600' : 'bg-gray-700'}`}>👨‍👩‍👧</button>
           </div>
 
-          {/* Stats - MOVED UP */}
+          {/* Stats */}
           {stats && (
             <div className="p-3 border-b border-gray-700 bg-gray-800/50">
               <div className="flex items-baseline gap-2">
@@ -620,19 +758,15 @@ function App() {
               <div className="flex gap-2 mt-1 text-xs text-gray-500">
                 {LANGUAGES.map(l => <span key={l.code}>{l.flag}{stats.byLang[l.code]}</span>)}
               </div>
+              {stats.missing > 0 && <div className="text-xs text-yellow-400 mt-1">⚠️ {stats.missing} без перевода</div>}
             </div>
           )}
 
           {/* Alerts */}
           {duplicates.length > 0 && (
-            <button onClick={() => setDuplicatesOpen(true)} className="mx-2 mt-2 p-2 bg-yellow-900/50 border border-yellow-600 rounded text-sm text-yellow-400 text-left">
+            <button onClick={() => setDuplicatesOpen(true)} className="mx-2 mt-2 p-2 bg-red-900/50 border border-red-600 rounded text-sm text-red-400 text-left">
               ⚠️ {duplicates.length} дубликатов
             </button>
-          )}
-          {missingTranslations > 0 && (
-            <div className="mx-2 mt-2 p-2 bg-blue-900/30 border border-blue-600/50 rounded text-xs text-blue-300">
-              📝 {missingTranslations} слов без перевода
-            </div>
           )}
 
           {/* Categories */}
@@ -649,8 +783,10 @@ function App() {
                     <span className="truncate">{cat.emoji} {cat.name}</span>
                     <span className="text-xs opacity-50">{data.words[cat.id]?.length || 0}</span>
                   </div>
-                  <div className="text-xs opacity-50 mt-0.5">
-                    Жесть: <span className={cat.intensityMax >= 8 ? 'text-red-400' : cat.intensityMax >= 5 ? 'text-yellow-400' : 'text-green-400'}>{cat.intensityMin}-{cat.intensityMax}</span>
+                  <div className="text-xs opacity-50">
+                    <span className={cat.intensityMax >= 8 ? 'text-red-400' : cat.intensityMax >= 5 ? 'text-yellow-400' : 'text-green-400'}>
+                      {cat.intensityMin}-{cat.intensityMax}
+                    </span>
                   </div>
                 </button>
                 {!DEFAULT_ADULT_CATEGORIES.find(c => c.id === cat.id) && !DEFAULT_FAMILY_CATEGORIES.find(c => c.id === cat.id) && (
@@ -670,7 +806,7 @@ function App() {
                 <span className="text-xl">{currentCategory.emoji}</span>
                 <div>
                   <div className="font-medium text-sm">{currentCategory.name}</div>
-                  <div className="text-xs text-gray-500">Жесть {currentCategory.intensityMin}-{currentCategory.intensityMax}</div>
+                  <div className="text-xs text-gray-500">{currentCategory.intensityMin}-{currentCategory.intensityMax}</div>
                 </div>
               </div>
             )}
@@ -679,7 +815,6 @@ function App() {
               className="px-2 py-1 bg-gray-700 rounded border border-gray-600 text-sm w-32" />
             
             <div className="flex items-center gap-1 text-xs">
-              <span className="text-gray-500">Жесть:</span>
               <input type="number" min={1} max={10} value={intensityFilter[0]} onChange={e => setIntensityFilter([Number(e.target.value), intensityFilter[1]])}
                 className="w-10 px-1 py-1 bg-gray-700 rounded text-center" />
               <span>-</span>
@@ -697,16 +832,10 @@ function App() {
             {selectedWords.size > 0 && (
               <>
                 <button onClick={() => setMoveToCategory('_')} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">
-                  📦 Переместить ({selectedWords.size})
+                  📦 ({selectedWords.size})
                 </button>
-                <button onClick={() => {
-                  if (!data || !confirm(`Удалить ${selectedWords.size} слов?`)) return
-                  const words = (data.words[selectedCategory] || []).filter((_, i) => !selectedWords.has(i))
-                  setData({ ...data, words: { ...data.words, [selectedCategory]: words } })
-                  setSelectedWords(new Set())
-                  setHasChanges(true)
-                }} className="px-2 py-1 bg-red-600 hover:bg-red-700 rounded text-xs">
-                  🗑️ Удалить ({selectedWords.size})
+                <button onClick={handleBulkDelete} className="px-2 py-1 bg-red-600 hover:bg-red-700 rounded text-xs">
+                  🗑️ ({selectedWords.size})
                 </button>
               </>
             )}
@@ -721,31 +850,31 @@ function App() {
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-gray-800 z-10">
                 <tr className="border-b border-gray-700">
-                  <th className="py-2 px-2 w-8"><input type="checkbox" onChange={e => {
-                    if (e.target.checked) setSelectedWords(new Set(currentWords.map(w => w._idx)))
-                    else setSelectedWords(new Set())
-                  }} /></th>
+                  <th className="py-2 px-2 w-8">
+                    <input type="checkbox" onChange={e => {
+                      if (e.target.checked) setSelectedWords(new Set(currentWords.map(w => w._idx!)))
+                      else setSelectedWords(new Set())
+                    }} checked={selectedWords.size > 0 && selectedWords.size === currentWords.length} />
+                  </th>
                   <th className="text-left py-2 px-2 w-10">#</th>
                   {LANGUAGES.map(l => <th key={l.code} className="text-left py-2 px-2">{l.flag}</th>)}
-                  <th className="text-center py-2 px-2 w-16 cursor-pointer hover:text-blue-400" onClick={() => setSortByIntensity(s => s === 'asc' ? 'desc' : 'asc')}>
-                    ⚖️ {sortByIntensity === 'asc' ? '↑' : sortByIntensity === 'desc' ? '↓' : ''}
-                  </th>
+                  <th className="text-center py-2 px-2 w-16 cursor-pointer hover:text-blue-400" onClick={() => setSortByIntensity(s => s === 'asc' ? 'desc' : 'asc')}>⚖️</th>
                   <th className="w-10"></th>
                 </tr>
               </thead>
               <tbody>
                 {currentWords.length === 0 ? (
                   <tr><td colSpan={8} className="text-center py-8 text-gray-500">
-                    Нет слов • <button onClick={() => setAddWordsOpen(true)} className="text-green-400 hover:underline">Добавить</button>
+                    {searchQuery ? 'Ничего не найдено' : 'Нет слов'} • 
+                    <button onClick={() => setAddWordsOpen(true)} className="text-green-400 hover:underline ml-1">Добавить</button>
                   </td></tr>
                 ) : currentWords.map((word, idx) => (
-                  <tr key={word._idx} className={`border-b border-gray-700/30 hover:bg-gray-800/50 ${selectedWords.has(word._idx) ? 'bg-blue-900/20' : ''}`}>
+                  <tr key={word._idx} className={`border-b border-gray-700/30 hover:bg-gray-800/50 ${selectedWords.has(word._idx!) ? 'bg-blue-900/20' : ''}`}>
                     <td className="py-1 px-2">
-                      <input type="checkbox" checked={selectedWords.has(word._idx)}
+                      <input type="checkbox" checked={selectedWords.has(word._idx!)}
                         onChange={e => {
                           const newSet = new Set(selectedWords)
-                          if (e.target.checked) newSet.add(word._idx)
-                          else newSet.delete(word._idx)
+                          if (e.target.checked) newSet.add(word._idx!); else newSet.delete(word._idx!)
                           setSelectedWords(newSet)
                         }} />
                     </td>
@@ -758,7 +887,7 @@ function App() {
                             className="w-full px-1 py-0.5 bg-gray-700 rounded border border-blue-500 text-sm" />
                         ) : (
                           <span onClick={() => startEdit(idx, l.code)}
-                            className={`cursor-pointer hover:bg-gray-700/50 px-1 py-0.5 rounded block truncate ${!word[l.code] ? 'text-gray-600' : ''}`}>
+                            className={`cursor-pointer hover:bg-gray-700/50 px-1 py-0.5 rounded block truncate ${!word[l.code] ? 'text-red-400/50 italic' : ''}`}>
                             {word[l.code] || '—'}
                           </span>
                         )}
@@ -777,7 +906,7 @@ function App() {
                       )}
                     </td>
                     <td className="py-1 px-2">
-                      <button onClick={() => handleDeleteWord(word._idx)} className="text-red-400/50 hover:text-red-400">×</button>
+                      <button onClick={() => handleDeleteWord(word._idx!)} className="text-red-400/50 hover:text-red-400">×</button>
                     </td>
                   </tr>
                 ))}
