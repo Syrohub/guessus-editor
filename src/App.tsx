@@ -644,9 +644,14 @@ function App() {
             {data?.categories.map(cat => (
               <div key={cat.id} className="flex items-center gap-1 mb-1">
                 <button onClick={() => { setSelectedCategory(cat.id); setSelectedWords(new Set()) }}
-                  className={`flex-1 py-1.5 px-2 rounded text-sm text-left flex items-center justify-between ${selectedCategory === cat.id ? 'bg-purple-600' : 'bg-gray-700/50 hover:bg-gray-700'}`}>
-                  <span className="truncate">{cat.emoji} {cat.name}</span>
-                  <span className="text-xs opacity-50">{data.words[cat.id]?.length || 0}</span>
+                  className={`flex-1 py-1.5 px-2 rounded text-sm text-left ${selectedCategory === cat.id ? 'bg-purple-600' : 'bg-gray-700/50 hover:bg-gray-700'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="truncate">{cat.emoji} {cat.name}</span>
+                    <span className="text-xs opacity-50">{data.words[cat.id]?.length || 0}</span>
+                  </div>
+                  <div className="text-xs opacity-50 mt-0.5">
+                    Жесть: <span className={cat.intensityMax >= 8 ? 'text-red-400' : cat.intensityMax >= 5 ? 'text-yellow-400' : 'text-green-400'}>{cat.intensityMin}-{cat.intensityMax}</span>
+                  </div>
                 </button>
                 {!DEFAULT_ADULT_CATEGORIES.find(c => c.id === cat.id) && !DEFAULT_FAMILY_CATEGORIES.find(c => c.id === cat.id) && (
                   <button onClick={() => handleDeleteCategory(cat.id)} className="p-1 text-red-400/50 hover:text-red-400 text-xs">×</button>
@@ -690,9 +695,20 @@ function App() {
             <div className="flex-1" />
             
             {selectedWords.size > 0 && (
-              <button onClick={() => setMoveToCategory('_')} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">
-                📦 Переместить ({selectedWords.size})
-              </button>
+              <>
+                <button onClick={() => setMoveToCategory('_')} className="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">
+                  📦 Переместить ({selectedWords.size})
+                </button>
+                <button onClick={() => {
+                  if (!data || !confirm(`Удалить ${selectedWords.size} слов?`)) return
+                  const words = (data.words[selectedCategory] || []).filter((_, i) => !selectedWords.has(i))
+                  setData({ ...data, words: { ...data.words, [selectedCategory]: words } })
+                  setSelectedWords(new Set())
+                  setHasChanges(true)
+                }} className="px-2 py-1 bg-red-600 hover:bg-red-700 rounded text-xs">
+                  🗑️ Удалить ({selectedWords.size})
+                </button>
+              </>
             )}
             
             <button onClick={() => setAddWordsOpen(true)} className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded text-sm">
