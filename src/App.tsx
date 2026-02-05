@@ -146,6 +146,78 @@ function App() {
     )
   }, [currentWords])
 
+  // Remove duplicates - keep first occurrence only
+  const removeDuplicates = () => {
+    if (!dictionary) return
+    
+    const seen = new Set<string>()
+    const uniqueWords: string[] = []
+    
+    currentWords.forEach(word => {
+      const lower = word.toLowerCase()
+      if (!seen.has(lower)) {
+        seen.add(lower)
+        uniqueWords.push(word)
+      }
+    })
+    
+    const removed = currentWords.length - uniqueWords.length
+    if (removed === 0) return
+    
+    setDictionary({
+      ...dictionary,
+      [language]: {
+        ...dictionary[language],
+        [category]: uniqueWords
+      }
+    })
+    setHasChanges(true)
+    alert(`Удалено ${removed} дубликатов!`)
+  }
+
+  // Remove ALL duplicates from ALL languages and categories
+  const removeAllDuplicates = () => {
+    if (!dictionary) return
+    
+    let totalRemoved = 0
+    const newDict = { ...dictionary }
+    
+    for (const lang of LANGUAGES) {
+      const cats = variant === 'adult' ? ADULT_CATEGORIES : FAMILY_CATEGORIES
+      for (const cat of cats) {
+        const words = newDict[lang.code]?.[cat.code] || []
+        const seen = new Set<string>()
+        const uniqueWords: string[] = []
+        
+        words.forEach(word => {
+          const lower = word.toLowerCase()
+          if (!seen.has(lower)) {
+            seen.add(lower)
+            uniqueWords.push(word)
+          }
+        })
+        
+        totalRemoved += words.length - uniqueWords.length
+        
+        if (newDict[lang.code]) {
+          newDict[lang.code] = {
+            ...newDict[lang.code],
+            [cat.code]: uniqueWords
+          }
+        }
+      }
+    }
+    
+    if (totalRemoved === 0) {
+      alert('Дубликатов не найдено!')
+      return
+    }
+    
+    setDictionary(newDict)
+    setHasChanges(true)
+    alert(`Удалено ${totalRemoved} дубликатов во всех категориях!`)
+  }
+
   // Add word
   const addWord = () => {
     if (!newWord.trim() || !dictionary) return
@@ -371,11 +443,30 @@ function App() {
           {duplicates.size > 0 && (
             <div className="bg-yellow-900/50 border border-yellow-600 rounded-lg p-4">
               <h3 className="text-sm font-semibold text-yellow-400 mb-1">⚠️ Дубликаты</h3>
-              <p className="text-xs text-yellow-200">
+              <p className="text-xs text-yellow-200 mb-2">
                 Найдено {duplicates.size} повторяющихся слов в этой категории
               </p>
+              <button
+                onClick={removeDuplicates}
+                className="w-full py-1.5 bg-yellow-600 hover:bg-yellow-700 rounded text-xs font-medium"
+              >
+                🗑️ Удалить дубликаты
+              </button>
             </div>
           )}
+
+          {/* Remove all duplicates button */}
+          <div className="bg-gray-800 rounded-lg p-4">
+            <button
+              onClick={removeAllDuplicates}
+              className="w-full py-2 bg-red-600 hover:bg-red-700 rounded text-sm font-medium"
+            >
+              🧹 Удалить ВСЕ дубликаты
+            </button>
+            <p className="text-xs text-gray-500 mt-1 text-center">
+              Во всех языках и категориях
+            </p>
+          </div>
         </aside>
 
         {/* Main content */}
