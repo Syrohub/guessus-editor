@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 
 // Types
 type Language = 'ru' | 'en' | 'es' | 'ua'
@@ -346,7 +346,7 @@ function App() {
     
     duplicates.forEach(dup => {
       // Keep first occurrence, remove rest
-      const [keep, ...remove] = dup.locations
+      const [, ...remove] = dup.locations
       remove.forEach(loc => {
         toRemove[loc.category].add(loc.index)
       })
@@ -642,11 +642,16 @@ function App() {
               <button onClick={() => setAddCategoryOpen(true)} className="text-xs bg-purple-600 hover:bg-purple-700 px-2 py-0.5 rounded">+</button>
             </div>
             {data?.categories.map(cat => (
-              <button key={cat.id} onClick={() => { setSelectedCategory(cat.id); setSelectedWords(new Set()) }}
-                className={`w-full mb-1 py-1.5 px-2 rounded text-sm text-left flex items-center justify-between ${selectedCategory === cat.id ? 'bg-purple-600' : 'bg-gray-700/50 hover:bg-gray-700'}`}>
-                <span className="truncate">{cat.emoji} {cat.name}</span>
-                <span className="text-xs opacity-50">{data.words[cat.id]?.length || 0}</span>
-              </button>
+              <div key={cat.id} className="flex items-center gap-1 mb-1">
+                <button onClick={() => { setSelectedCategory(cat.id); setSelectedWords(new Set()) }}
+                  className={`flex-1 py-1.5 px-2 rounded text-sm text-left flex items-center justify-between ${selectedCategory === cat.id ? 'bg-purple-600' : 'bg-gray-700/50 hover:bg-gray-700'}`}>
+                  <span className="truncate">{cat.emoji} {cat.name}</span>
+                  <span className="text-xs opacity-50">{data.words[cat.id]?.length || 0}</span>
+                </button>
+                {!DEFAULT_ADULT_CATEGORIES.find(c => c.id === cat.id) && !DEFAULT_FAMILY_CATEGORIES.find(c => c.id === cat.id) && (
+                  <button onClick={() => handleDeleteCategory(cat.id)} className="p-1 text-red-400/50 hover:text-red-400 text-xs">×</button>
+                )}
+              </div>
             ))}
           </div>
         </aside>
