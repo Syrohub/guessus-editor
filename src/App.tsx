@@ -38,6 +38,8 @@ const FAMILY_CATEGORIES: { code: FamilyCategory; name: string; emoji: string }[]
 ]
 
 const GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/Syrohub/guessus-dictionary/main'
+const GITHUB_REPO = 'Syrohub/guessus-dictionary'
+const GITHUB_API_BASE = 'https://api.github.com'
 
 // Modal component
 function Modal({ isOpen, onClose, title, children }: { 
@@ -85,6 +87,9 @@ function App() {
   const [newCategoryName, setNewCategoryName] = useState('')
   const [copyFromLangOpen, setCopyFromLangOpen] = useState(false)
   const [customCategories, setCustomCategories] = useState<string[]>([])
+  const [publishOpen, setPublishOpen] = useState(false)
+  const [githubToken, setGithubToken] = useState(() => localStorage.getItem('github_token') || '')
+  const [publishing, setPublishing] = useState(false)
 
   // Get categories based on variant + custom
   const baseCategories = variant === 'adult' ? ADULT_CATEGORIES : FAMILY_CATEGORIES
@@ -466,6 +471,102 @@ function App() {
     e.target.value = '' // Reset input
   }
 
+  // Save GitHub token
+  const saveGithubToken = (token: string) => {
+    setGithubToken(token)
+    localStorage.setItem('github_token', token)
+  }
+
+  // Publish to GitHub
+  const publishToGithub = async () => {
+    if (!dictionary || !githubToken) return
+    
+    setPublishing(true)
+    
+    try {
+      // Increment version
+      const currentVersion = version?.version || '1.0.0'
+      const versionParts = currentVersion.split('.').map(Number)
+      versionParts[2] = (versionParts[2] || 0) + 1
+      const newVersion = versionParts.join('.')
+      const today = new Date().toISOString().split('T')[0]
+      
+      const newVersionInfo = {
+        version: newVersion,
+        updatedAt: today
+      }
+      
+      // Files to update
+      const wordsFile = variant === 'adult' ? 'words-adult.json' : 'words.json'
+      const versionFile = variant === 'adult' ? 'version-adult.json' : 'version.json'
+      
+      // Get current file SHAs (needed for update)
+      const getFileSha = async (path: string): Promise<string | null> => {
+        try {
+          const res = await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${path}`, {
+            headers: { 'Authorization': `token ${githubToken}` }
+          })
+          if (res.ok) {
+            const data = await res.json()
+            return data.sha
+          }
+        } catch {}
+        return null
+      }
+      
+      const wordsSha = await getFileSha(wordsFile)
+      const versionSha = await getFileSha(versionFile)
+      
+      // Update words file
+      const wordsRes = await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${wordsFile}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `token ${githubToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          message: `Update ${wordsFile} to v${newVersion}`,
+          content: btoa(unescape(encodeURIComponent(JSON.stringify(dictionary, null, 2)))),
+          sha: wordsSha
+        })
+      })
+      
+      if (!wordsRes.ok) {
+        const err = await wordsRes.json()
+        throw new Error(err.message || 'Failed to update words file')
+      }
+      
+      // Update version file
+      const versionRes = await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${versionFile}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `token ${githubToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          message: `Bump version to ${newVersion}`,
+          content: btoa(unescape(encodeURIComponent(JSON.stringify(newVersionInfo, null, 2)))),
+          sha: versionSha
+        })
+      })
+      
+      if (!versionRes.ok) {
+        const err = await versionRes.json()
+        throw new Error(err.message || 'Failed to update version file')
+      }
+      
+      setVersion(newVersionInfo)
+      setHasChanges(false)
+      setPublishOpen(false)
+      alert(`✅ Опубликовано! Новая версия: ${newVersion}`)
+      
+    } catch (err) {
+      alert(`❌ Ошибка: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setPublishing(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
@@ -554,6 +655,62 @@ function App() {
         </div>
       </Modal>
 
+      {/* Publish to GitHub Modal */}
+      <Modal isOpen={publishOpen} onClose={() => setPublishOpen(false)} title="📤 Опубликовать в GitHub">
+        <div className="space-y-4">
+          <div>
+            <p className="text-gray-400 mb-2">
+              Это обновит словарь <strong>{variant === 'adult' ? 'Adult (18+)' : 'Family'}</strong> в репозитории:
+            </p>
+            <a 
+              href={`https://github.com/${GITHUB_REPO}`} 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="text-blue-400 hover:underline"
+            >
+              github.com/{GITHUB_REPO}
+            </a>
+          </div>
+          
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">GitHub Token:</label>
+            <input
+              type="password"
+              value={githubToken}
+              onChange={e => saveGithubToken(e.target.value)}
+              placeholder="ghp_xxxxxxxxxxxx"
+              className="w-full px-4 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Создать токен: <a href="https://github.com/settings/tokens/new?scopes=repo" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">github.com/settings/tokens</a> (нужен scope: repo)
+            </p>
+          </div>
+          
+          {version && (
+            <div className="bg-gray-700 rounded p-3">
+              <div className="text-sm text-gray-400">Текущая версия:</div>
+              <div className="font-mono">{version.version} ({version.updatedAt})</div>
+              <div className="text-sm text-gray-400 mt-2">Новая версия:</div>
+              <div className="font-mono text-green-400">
+                {version.version.split('.').map((v, i) => i === 2 ? Number(v) + 1 : v).join('.')}
+              </div>
+            </div>
+          )}
+          
+          <button
+            onClick={publishToGithub}
+            disabled={!githubToken || publishing}
+            className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded font-medium flex items-center justify-center gap-2"
+          >
+            {publishing ? (
+              <>⏳ Публикация...</>
+            ) : (
+              <>🚀 Опубликовать</>
+            )}
+          </button>
+        </div>
+      </Modal>
+
       {/* Header */}
       <header className="bg-gray-800 border-b border-gray-700 p-4">
         <div className="max-w-7xl mx-auto flex items-center justify-between flex-wrap gap-4">
@@ -585,6 +742,13 @@ function App() {
               className="px-3 py-1.5 bg-blue-600 rounded hover:bg-blue-700 text-sm"
             >
               💾 Скачать
+            </button>
+            <button
+              onClick={() => setPublishOpen(true)}
+              disabled={!hasChanges}
+              className="px-3 py-1.5 bg-green-600 rounded hover:bg-green-700 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              📤 Опубликовать
             </button>
           </div>
         </div>
