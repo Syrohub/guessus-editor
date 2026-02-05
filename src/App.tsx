@@ -2,12 +2,31 @@ import { useState, useEffect, useMemo } from 'react'
 
 // Types
 type Language = 'ru' | 'en' | 'es' | 'ua'
-type AdultCategory = 'party' | 'dirty' | 'extreme'
-type FamilyCategory = 'movies' | 'food' | 'animals' | 'sports' | 'travel' | 'professions'
-type Category = AdultCategory | FamilyCategory | string
 type DictionaryVariant = 'adult' | 'family'
 
-type WordDatabase = Record<Language, Partial<Record<string, string[]>>>
+interface Word {
+  ru: string
+  en: string
+  es: string
+  ua: string
+  intensity: number
+}
+
+interface CategoryMeta {
+  id: string
+  name: string
+  emoji: string
+  intensityMin: number
+  intensityMax: number
+}
+
+interface DictionaryData {
+  categories: CategoryMeta[]
+  words: Record<string, Word[]>
+}
+
+// Legacy format (current GitHub structure)
+type LegacyWordDatabase = Record<Language, Partial<Record<string, string[]>>>
 
 interface VersionInfo {
   version: string
@@ -22,42 +41,57 @@ const LANGUAGES: { code: Language; name: string; flag: string }[] = [
   { code: 'ua', name: 'Українська', flag: '🇺🇦' },
 ]
 
-const ADULT_CATEGORIES: { code: AdultCategory; name: string; emoji: string }[] = [
-  { code: 'party', name: 'Party', emoji: '🎉' },
-  { code: 'dirty', name: 'Dirty', emoji: '🔞' },
-  { code: 'extreme', name: 'Extreme', emoji: '💀' },
+const DEFAULT_ADULT_CATEGORIES: CategoryMeta[] = [
+  { id: 'party', name: 'Party', emoji: '🎉', intensityMin: 2, intensityMax: 5 },
+  { id: 'dirty', name: 'Dirty', emoji: '🔞', intensityMin: 5, intensityMax: 8 },
+  { id: 'extreme', name: 'Extreme', emoji: '💀', intensityMin: 8, intensityMax: 10 },
 ]
 
-const FAMILY_CATEGORIES: { code: FamilyCategory; name: string; emoji: string }[] = [
-  { code: 'movies', name: 'Movies', emoji: '🎬' },
-  { code: 'food', name: 'Food', emoji: '🍕' },
-  { code: 'animals', name: 'Animals', emoji: '🐱' },
-  { code: 'sports', name: 'Sports', emoji: '⚽' },
-  { code: 'travel', name: 'Travel', emoji: '✈️' },
-  { code: 'professions', name: 'Professions', emoji: '👨‍⚕️' },
+const DEFAULT_FAMILY_CATEGORIES: CategoryMeta[] = [
+  { id: 'movies', name: 'Movies', emoji: '🎬', intensityMin: 1, intensityMax: 2 },
+  { id: 'food', name: 'Food', emoji: '🍕', intensityMin: 1, intensityMax: 2 },
+  { id: 'animals', name: 'Animals', emoji: '🐱', intensityMin: 1, intensityMax: 2 },
+  { id: 'sports', name: 'Sports', emoji: '⚽', intensityMin: 1, intensityMax: 2 },
+  { id: 'travel', name: 'Travel', emoji: '✈️', intensityMin: 1, intensityMax: 2 },
+  { id: 'professions', name: 'Professions', emoji: '👨‍⚕️', intensityMin: 1, intensityMax: 2 },
 ]
 
 const GITHUB_RAW_BASE = 'https://raw.githubusercontent.com/Syrohub/guessus-dictionary/main'
 const GITHUB_REPO = 'Syrohub/guessus-dictionary'
 const GITHUB_API_BASE = 'https://api.github.com'
 
+// Intensity descriptions
+const INTENSITY_LABELS: Record<number, string> = {
+  1: 'Безобидно',
+  2: 'Мягко', 
+  3: 'Лёгкий намёк',
+  4: 'Игриво',
+  5: 'Пикантно',
+  6: 'Откровенно',
+  7: 'Дерзко',
+  8: 'Жёстко',
+  9: 'Экстрим',
+  10: 'Табу',
+}
+
 // Modal component
-function Modal({ isOpen, onClose, title, children }: { 
-  isOpen: boolean; 
-  onClose: () => void; 
-  title: string; 
-  children: React.ReactNode 
+function Modal({ isOpen, onClose, title, children, wide }: { 
+  isOpen: boolean
+  onClose: () => void
+  title: string
+  children: React.ReactNode
+  wide?: boolean
 }) {
   if (!isOpen) return null
   
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-gray-800 rounded-lg max-w-2xl w-full max-h-[80vh] overflow-hidden">
-        <div className="flex items-center justify-between p-4 border-b border-gray-700">
+      <div className={`bg-gray-800 rounded-lg ${wide ? 'max-w-4xl' : 'max-w-lg'} w-full max-h-[90vh] overflow-hidden flex flex-col`}>
+        <div className="flex items-center justify-between p-4 border-b border-gray-700 flex-shrink-0">
           <h2 className="text-xl font-bold">{title}</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-white text-2xl">&times;</button>
+          <button onClick={onClose} className="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
         </div>
-        <div className="p-4 overflow-y-auto max-h-[60vh]">
+        <div className="p-4 overflow-y-auto flex-1">
           {children}
         </div>
       </div>
@@ -65,451 +99,316 @@ function Modal({ isOpen, onClose, title, children }: {
   )
 }
 
+// Convert legacy format to new format
+function convertLegacyToNew(legacy: LegacyWordDatabase, variant: DictionaryVariant): DictionaryData {
+  const defaultCats = variant === 'adult' ? DEFAULT_ADULT_CATEGORIES : DEFAULT_FAMILY_CATEGORIES
+  const categories = [...defaultCats]
+  const words: Record<string, Word[]> = {}
+  
+  // Get all category IDs from the data
+  const allCatIds = new Set<string>()
+  for (const lang of LANGUAGES) {
+    Object.keys(legacy[lang.code] || {}).forEach(cat => allCatIds.add(cat))
+  }
+  
+  // Add any missing categories
+  allCatIds.forEach(catId => {
+    if (!categories.find(c => c.id === catId)) {
+      categories.push({
+        id: catId,
+        name: catId.charAt(0).toUpperCase() + catId.slice(1),
+        emoji: '📁',
+        intensityMin: 1,
+        intensityMax: 10,
+      })
+    }
+  })
+  
+  // Convert words
+  for (const cat of categories) {
+    const ruWords = legacy.ru?.[cat.id] || []
+    const enWords = legacy.en?.[cat.id] || []
+    const esWords = legacy.es?.[cat.id] || []
+    const uaWords = legacy.ua?.[cat.id] || []
+    
+    const maxLen = Math.max(ruWords.length, enWords.length, esWords.length, uaWords.length)
+    const catWords: Word[] = []
+    
+    for (let i = 0; i < maxLen; i++) {
+      catWords.push({
+        ru: ruWords[i] || '',
+        en: enWords[i] || '',
+        es: esWords[i] || '',
+        ua: uaWords[i] || '',
+        intensity: Math.floor(Math.random() * (cat.intensityMax - cat.intensityMin + 1)) + cat.intensityMin,
+      })
+    }
+    
+    words[cat.id] = catWords
+  }
+  
+  return { categories, words }
+}
+
+// Convert new format back to legacy for GitHub
+function convertNewToLegacy(data: DictionaryData): LegacyWordDatabase {
+  const legacy: LegacyWordDatabase = { ru: {}, en: {}, es: {}, ua: {} }
+  
+  for (const cat of data.categories) {
+    const catWords = data.words[cat.id] || []
+    legacy.ru[cat.id] = catWords.map(w => w.ru).filter(Boolean)
+    legacy.en[cat.id] = catWords.map(w => w.en).filter(Boolean)
+    legacy.es[cat.id] = catWords.map(w => w.es).filter(Boolean)
+    legacy.ua[cat.id] = catWords.map(w => w.ua).filter(Boolean)
+  }
+  
+  return legacy
+}
+
 function App() {
   // State
   const [variant, setVariant] = useState<DictionaryVariant>('adult')
-  const [language, setLanguage] = useState<Language>('ru')
-  const [category, setCategory] = useState<Category>('party')
-  const [dictionary, setDictionary] = useState<WordDatabase | null>(null)
+  const [data, setData] = useState<DictionaryData | null>(null)
   const [version, setVersion] = useState<VersionInfo | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [selectedCategory, setSelectedCategory] = useState<string>('party')
   const [searchQuery, setSearchQuery] = useState('')
-  const [newWord, setNewWord] = useState('')
-  const [editingIndex, setEditingIndex] = useState<number | null>(null)
-  const [editingValue, setEditingValue] = useState('')
+  const [intensityFilter, setIntensityFilter] = useState<[number, number]>([1, 10])
   const [hasChanges, setHasChanges] = useState(false)
   
   // Modal states
-  const [bulkAddOpen, setBulkAddOpen] = useState(false)
-  const [bulkText, setBulkText] = useState('')
   const [addCategoryOpen, setAddCategoryOpen] = useState(false)
-  const [newCategoryName, setNewCategoryName] = useState('')
-  const [copyFromLangOpen, setCopyFromLangOpen] = useState(false)
-  const [customCategories, setCustomCategories] = useState<string[]>([])
-  const [publishOpen, setPublishOpen] = useState(false)
+  const [newCategory, setNewCategory] = useState<CategoryMeta>({
+    id: '', name: '', emoji: '📁', intensityMin: 3, intensityMax: 7
+  })
+  const [addWordOpen, setAddWordOpen] = useState(false)
+  const [newWord, setNewWord] = useState<Word>({ ru: '', en: '', es: '', ua: '', intensity: 5 })
+  const [editingCell, setEditingCell] = useState<{ wordIdx: number; field: keyof Word } | null>(null)
+  const [editValue, setEditValue] = useState('')
+  
+  // GitHub
   const [githubToken, setGithubToken] = useState(() => localStorage.getItem('github_token') || '')
   const [publishing, setPublishing] = useState(false)
+  const [publishOpen, setPublishOpen] = useState(false)
 
-  // Get categories based on variant + custom
-  const baseCategories = variant === 'adult' ? ADULT_CATEGORIES : FAMILY_CATEGORIES
-  const allCategories = [
-    ...baseCategories,
-    ...customCategories.map(c => ({ code: c, name: c, emoji: '📁' }))
-  ]
-
-  // Load dictionary from GitHub
+  // Load dictionary
   useEffect(() => {
     loadDictionary()
   }, [variant])
 
-  // Reset category when variant changes
   useEffect(() => {
-    setCategory(variant === 'adult' ? 'party' : 'movies')
+    const cats = variant === 'adult' ? DEFAULT_ADULT_CATEGORIES : DEFAULT_FAMILY_CATEGORIES
+    setSelectedCategory(cats[0].id)
   }, [variant])
-
-  // Detect custom categories from loaded dictionary
-  useEffect(() => {
-    if (!dictionary) return
-    const baseCodes = new Set(baseCategories.map(c => c.code))
-    const custom: string[] = []
-    
-    for (const lang of LANGUAGES) {
-      const cats = Object.keys(dictionary[lang.code] || {})
-      for (const cat of cats) {
-        if (!baseCodes.has(cat as any) && !custom.includes(cat)) {
-          custom.push(cat)
-        }
-      }
-    }
-    setCustomCategories(custom)
-  }, [dictionary, variant])
 
   const loadDictionary = async () => {
     setLoading(true)
-    setError(null)
-    
     try {
       const wordsFile = variant === 'adult' ? 'words-adult.json' : 'words.json'
       const versionFile = variant === 'adult' ? 'version-adult.json' : 'version.json'
       
       const [wordsRes, versionRes] = await Promise.all([
-        fetch(`${GITHUB_RAW_BASE}/${wordsFile}`),
-        fetch(`${GITHUB_RAW_BASE}/${versionFile}`)
+        fetch(`${GITHUB_RAW_BASE}/${wordsFile}?t=${Date.now()}`),
+        fetch(`${GITHUB_RAW_BASE}/${versionFile}?t=${Date.now()}`)
       ])
       
-      if (!wordsRes.ok || !versionRes.ok) {
-        throw new Error('Failed to load dictionary')
+      if (wordsRes.ok && versionRes.ok) {
+        const legacy = await wordsRes.json()
+        const ver = await versionRes.json()
+        setData(convertLegacyToNew(legacy, variant))
+        setVersion(ver)
+        setHasChanges(false)
       }
-      
-      const words = await wordsRes.json()
-      const ver = await versionRes.json()
-      
-      setDictionary(words)
-      setVersion(ver)
-      setHasChanges(false)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unknown error')
+      console.error('Load error:', e)
     } finally {
       setLoading(false)
     }
   }
 
-  // Get current words
-  const currentWords = useMemo(() => {
-    if (!dictionary) return []
-    return dictionary[language]?.[category] || []
-  }, [dictionary, language, category])
+  // Current category
+  const currentCategory = useMemo(() => {
+    return data?.categories.find(c => c.id === selectedCategory)
+  }, [data, selectedCategory])
 
-  // Filtered words
-  const filteredWords = useMemo(() => {
-    if (!searchQuery) return currentWords
-    const query = searchQuery.toLowerCase()
-    return currentWords.filter(word => word.toLowerCase().includes(query))
-  }, [currentWords, searchQuery])
+  // Current words (filtered)
+  const currentWords = useMemo(() => {
+    if (!data) return []
+    let words = data.words[selectedCategory] || []
+    
+    // Filter by intensity
+    words = words.filter(w => w.intensity >= intensityFilter[0] && w.intensity <= intensityFilter[1])
+    
+    // Filter by search
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase()
+      words = words.filter(w => 
+        w.ru.toLowerCase().includes(q) ||
+        w.en.toLowerCase().includes(q) ||
+        w.es.toLowerCase().includes(q) ||
+        w.ua.toLowerCase().includes(q)
+      )
+    }
+    
+    return words
+  }, [data, selectedCategory, intensityFilter, searchQuery])
 
   // Stats
   const stats = useMemo(() => {
-    if (!dictionary) return null
+    if (!data) return null
+    let total = 0
+    const byLang = { ru: 0, en: 0, es: 0, ua: 0 }
     
-    const total = Object.values(dictionary).reduce((langSum, cats) => 
-      langSum + Object.values(cats).reduce((catSum, words) => 
-        catSum + (words?.length || 0), 0), 0)
-    
-    const byLanguage = Object.fromEntries(
-      LANGUAGES.map(lang => [
-        lang.code,
-        Object.values(dictionary[lang.code] || {}).reduce((sum, words) => sum + (words?.length || 0), 0)
-      ])
-    )
-    
-    return { total, byLanguage }
-  }, [dictionary])
-
-  // Find duplicates
-  const duplicates = useMemo(() => {
-    const seen = new Map<string, number[]>()
-    currentWords.forEach((word, idx) => {
-      const lower = word.toLowerCase()
-      if (seen.has(lower)) {
-        seen.get(lower)!.push(idx)
-      } else {
-        seen.set(lower, [idx])
-      }
-    })
-    return new Set(
-      Array.from(seen.values())
-        .filter(indices => indices.length > 1)
-        .flat()
-    )
-  }, [currentWords])
-
-  // Remove duplicates
-  const removeDuplicates = () => {
-    if (!dictionary) return
-    
-    const seen = new Set<string>()
-    const uniqueWords: string[] = []
-    
-    currentWords.forEach(word => {
-      const lower = word.toLowerCase()
-      if (!seen.has(lower)) {
-        seen.add(lower)
-        uniqueWords.push(word)
-      }
+    Object.values(data.words).forEach(words => {
+      words.forEach(w => {
+        total++
+        if (w.ru) byLang.ru++
+        if (w.en) byLang.en++
+        if (w.es) byLang.es++
+        if (w.ua) byLang.ua++
+      })
     })
     
-    const removed = currentWords.length - uniqueWords.length
-    if (removed === 0) return
-    
-    setDictionary({
-      ...dictionary,
-      [language]: {
-        ...dictionary[language],
-        [category]: uniqueWords
-      }
-    })
-    setHasChanges(true)
-    alert(`Удалено ${removed} дубликатов!`)
-  }
+    return { total, byLang }
+  }, [data])
 
-  // Remove ALL duplicates
-  const removeAllDuplicates = () => {
-    if (!dictionary) return
+  // Add category
+  const handleAddCategory = () => {
+    if (!data || !newCategory.name) return
     
-    let totalRemoved = 0
-    const newDict = { ...dictionary }
-    
-    for (const lang of LANGUAGES) {
-      for (const cat of allCategories) {
-        const words = newDict[lang.code]?.[cat.code] || []
-        const seen = new Set<string>()
-        const uniqueWords: string[] = []
-        
-        words.forEach(word => {
-          const lower = word.toLowerCase()
-          if (!seen.has(lower)) {
-            seen.add(lower)
-            uniqueWords.push(word)
-          }
-        })
-        
-        totalRemoved += words.length - uniqueWords.length
-        
-        if (newDict[lang.code]) {
-          newDict[lang.code] = {
-            ...newDict[lang.code],
-            [cat.code]: uniqueWords
-          }
-        }
-      }
-    }
-    
-    if (totalRemoved === 0) {
-      alert('Дубликатов не найдено!')
+    const id = newCategory.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+    if (data.categories.find(c => c.id === id)) {
+      alert('Категория с таким ID уже существует')
       return
     }
     
-    setDictionary(newDict)
-    setHasChanges(true)
-    alert(`Удалено ${totalRemoved} дубликатов во всех категориях!`)
-  }
-
-  // Add word
-  const addWord = () => {
-    if (!newWord.trim() || !dictionary) return
-    
-    const words = [...(dictionary[language]?.[category] || []), newWord.trim()]
-    setDictionary({
-      ...dictionary,
-      [language]: {
-        ...dictionary[language],
-        [category]: words
-      }
+    const cat: CategoryMeta = { ...newCategory, id }
+    setData({
+      ...data,
+      categories: [...data.categories, cat],
+      words: { ...data.words, [id]: [] }
     })
-    setNewWord('')
-    setHasChanges(true)
-  }
-
-  // Bulk add words
-  const bulkAddWords = () => {
-    if (!bulkText.trim() || !dictionary) return
-    
-    const newWords = bulkText
-      .split('\n')
-      .map(w => w.trim())
-      .filter(w => w.length > 0)
-    
-    if (newWords.length === 0) return
-    
-    const existingWords = dictionary[language]?.[category] || []
-    const existingLower = new Set(existingWords.map(w => w.toLowerCase()))
-    
-    const uniqueNewWords = newWords.filter(w => !existingLower.has(w.toLowerCase()))
-    
-    setDictionary({
-      ...dictionary,
-      [language]: {
-        ...dictionary[language],
-        [category]: [...existingWords, ...uniqueNewWords]
-      }
-    })
-    
-    setBulkText('')
-    setBulkAddOpen(false)
-    setHasChanges(true)
-    alert(`Добавлено ${uniqueNewWords.length} слов (пропущено ${newWords.length - uniqueNewWords.length} дубликатов)`)
-  }
-
-  // Add new category
-  const addCategory = () => {
-    if (!newCategoryName.trim() || !dictionary) return
-    
-    const catCode = newCategoryName.trim().toLowerCase().replace(/\s+/g, '_')
-    
-    // Add empty category to all languages
-    const newDict = { ...dictionary }
-    for (const lang of LANGUAGES) {
-      newDict[lang.code] = {
-        ...newDict[lang.code],
-        [catCode]: []
-      }
-    }
-    
-    setDictionary(newDict)
-    setCustomCategories([...customCategories, catCode])
-    setCategory(catCode)
-    setNewCategoryName('')
+    setSelectedCategory(id)
+    setNewCategory({ id: '', name: '', emoji: '📁', intensityMin: 3, intensityMax: 7 })
     setAddCategoryOpen(false)
     setHasChanges(true)
   }
 
-  // Copy words from another language
-  const copyFromLanguage = (sourceLang: Language) => {
-    if (!dictionary || sourceLang === language) return
+  // Delete category
+  const handleDeleteCategory = (catId: string) => {
+    if (!data) return
+    if (!confirm(`Удалить категорию "${catId}" и все её слова?`)) return
     
-    const sourceWords = dictionary[sourceLang]?.[category] || []
-    if (sourceWords.length === 0) {
-      alert(`Нет слов в ${sourceLang.toUpperCase()} для этой категории`)
-      return
-    }
-    
-    const existingWords = dictionary[language]?.[category] || []
-    const existingLower = new Set(existingWords.map(w => w.toLowerCase()))
-    
-    const newWords = sourceWords.filter(w => !existingLower.has(w.toLowerCase()))
-    
-    setDictionary({
-      ...dictionary,
-      [language]: {
-        ...dictionary[language],
-        [category]: [...existingWords, ...newWords]
-      }
+    const { [catId]: _, ...restWords } = data.words
+    setData({
+      ...data,
+      categories: data.categories.filter(c => c.id !== catId),
+      words: restWords
     })
     
-    setCopyFromLangOpen(false)
+    const defaultCats = variant === 'adult' ? DEFAULT_ADULT_CATEGORIES : DEFAULT_FAMILY_CATEGORIES
+    setSelectedCategory(defaultCats[0]?.id || '')
     setHasChanges(true)
-    alert(`Скопировано ${newWords.length} слов из ${sourceLang.toUpperCase()}`)
+  }
+
+  // Add word
+  const handleAddWord = () => {
+    if (!data || !newWord.ru) return
+    
+    const catIntensity = currentCategory 
+      ? Math.max(currentCategory.intensityMin, Math.min(currentCategory.intensityMax, newWord.intensity))
+      : newWord.intensity
+    
+    setData({
+      ...data,
+      words: {
+        ...data.words,
+        [selectedCategory]: [...(data.words[selectedCategory] || []), { ...newWord, intensity: catIntensity }]
+      }
+    })
+    setNewWord({ ru: '', en: '', es: '', ua: '', intensity: currentCategory?.intensityMin || 5 })
+    setAddWordOpen(false)
+    setHasChanges(true)
   }
 
   // Delete word
-  const deleteWord = (index: number) => {
-    if (!dictionary) return
+  const handleDeleteWord = (idx: number) => {
+    if (!data) return
     
-    const words = [...(dictionary[language]?.[category] || [])]
-    words.splice(index, 1)
-    setDictionary({
-      ...dictionary,
-      [language]: {
-        ...dictionary[language],
-        [category]: words
-      }
+    const words = [...(data.words[selectedCategory] || [])]
+    const actualIdx = data.words[selectedCategory]?.indexOf(currentWords[idx])
+    if (actualIdx === undefined || actualIdx === -1) return
+    
+    words.splice(actualIdx, 1)
+    setData({
+      ...data,
+      words: { ...data.words, [selectedCategory]: words }
     })
     setHasChanges(true)
   }
 
-  // Start editing
-  const startEdit = (index: number) => {
-    setEditingIndex(index)
-    setEditingValue(currentWords[index])
+  // Edit cell
+  const startEdit = (wordIdx: number, field: keyof Word) => {
+    const word = currentWords[wordIdx]
+    setEditingCell({ wordIdx, field })
+    setEditValue(String(word[field]))
   }
 
-  // Save edit
   const saveEdit = () => {
-    if (editingIndex === null || !dictionary || !editingValue.trim()) return
+    if (!editingCell || !data) return
     
-    const words = [...(dictionary[language]?.[category] || [])]
-    words[editingIndex] = editingValue.trim()
-    setDictionary({
-      ...dictionary,
-      [language]: {
-        ...dictionary[language],
-        [category]: words
-      }
+    const word = currentWords[editingCell.wordIdx]
+    const actualIdx = data.words[selectedCategory]?.indexOf(word)
+    if (actualIdx === undefined || actualIdx === -1) return
+    
+    const words = [...(data.words[selectedCategory] || [])]
+    const newValue = editingCell.field === 'intensity' ? Number(editValue) || 5 : editValue
+    words[actualIdx] = { ...word, [editingCell.field]: newValue }
+    
+    setData({
+      ...data,
+      words: { ...data.words, [selectedCategory]: words }
     })
-    setEditingIndex(null)
-    setEditingValue('')
+    setEditingCell(null)
+    setEditValue('')
     setHasChanges(true)
   }
 
-  // Delete category
-  const deleteCategory = (catCode: string) => {
-    if (!dictionary) return
-    if (!confirm(`Удалить категорию "${catCode}" из всех языков?`)) return
-    
-    const newDict = { ...dictionary }
-    for (const lang of LANGUAGES) {
-      if (newDict[lang.code]?.[catCode]) {
-        const { [catCode]: _, ...rest } = newDict[lang.code]!
-        newDict[lang.code] = rest
-      }
-    }
-    
-    setDictionary(newDict)
-    setCustomCategories(customCategories.filter(c => c !== catCode))
-    setCategory(baseCategories[0].code)
-    setHasChanges(true)
-  }
-
-  // Export JSON
+  // Export
   const exportJson = () => {
-    if (!dictionary) return
-    
-    const blob = new Blob([JSON.stringify(dictionary, null, 2)], { type: 'application/json' })
+    if (!data) return
+    const legacy = convertNewToLegacy(data)
+    const blob = new Blob([JSON.stringify(legacy, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
     a.download = variant === 'adult' ? 'words-adult.json' : 'words.json'
     a.click()
-    URL.revokeObjectURL(url)
-  }
-
-  // Copy to clipboard
-  const copyToClipboard = () => {
-    if (!dictionary) return
-    navigator.clipboard.writeText(JSON.stringify(dictionary, null, 2))
-    alert('JSON скопирован в буфер обмена!')
-  }
-
-  // Import from file
-  const importFromFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    
-    const reader = new FileReader()
-    reader.onload = (event) => {
-      try {
-        const data = JSON.parse(event.target?.result as string)
-        setDictionary(data)
-        setHasChanges(true)
-        alert('Словарь загружен!')
-      } catch {
-        alert('Ошибка: неверный формат JSON')
-      }
-    }
-    reader.readAsText(file)
-    e.target.value = '' // Reset input
-  }
-
-  // Save GitHub token
-  const saveGithubToken = (token: string) => {
-    setGithubToken(token)
-    localStorage.setItem('github_token', token)
   }
 
   // Publish to GitHub
   const publishToGithub = async () => {
-    if (!dictionary || !githubToken) return
+    if (!data || !githubToken) return
     
     setPublishing(true)
-    
     try {
-      // Increment version
+      const legacy = convertNewToLegacy(data)
       const currentVersion = version?.version || '1.0.0'
       const versionParts = currentVersion.split('.').map(Number)
       versionParts[2] = (versionParts[2] || 0) + 1
       const newVersion = versionParts.join('.')
       const today = new Date().toISOString().split('T')[0]
+      const newVersionInfo = { version: newVersion, updatedAt: today }
       
-      const newVersionInfo = {
-        version: newVersion,
-        updatedAt: today
-      }
-      
-      // Files to update
       const wordsFile = variant === 'adult' ? 'words-adult.json' : 'words.json'
       const versionFile = variant === 'adult' ? 'version-adult.json' : 'version.json'
       
-      // Get current file SHAs (needed for update)
       const getFileSha = async (path: string): Promise<string | null> => {
         try {
           const res = await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${path}`, {
             headers: { 'Authorization': `token ${githubToken}` }
           })
-          if (res.ok) {
-            const data = await res.json()
-            return data.sha
-          }
+          if (res.ok) return (await res.json()).sha
         } catch {}
         return null
       }
@@ -517,32 +416,19 @@ function App() {
       const wordsSha = await getFileSha(wordsFile)
       const versionSha = await getFileSha(versionFile)
       
-      // Update words file
-      const wordsRes = await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${wordsFile}`, {
+      await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${wordsFile}`, {
         method: 'PUT',
-        headers: {
-          'Authorization': `token ${githubToken}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Authorization': `token ${githubToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: `Update ${wordsFile} to v${newVersion}`,
-          content: btoa(unescape(encodeURIComponent(JSON.stringify(dictionary, null, 2)))),
+          content: btoa(unescape(encodeURIComponent(JSON.stringify(legacy, null, 2)))),
           sha: wordsSha
         })
       })
       
-      if (!wordsRes.ok) {
-        const err = await wordsRes.json()
-        throw new Error(err.message || 'Failed to update words file')
-      }
-      
-      // Update version file
-      const versionRes = await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${versionFile}`, {
+      await fetch(`${GITHUB_API_BASE}/repos/${GITHUB_REPO}/contents/${versionFile}`, {
         method: 'PUT',
-        headers: {
-          'Authorization': `token ${githubToken}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Authorization': `token ${githubToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: `Bump version to ${newVersion}`,
           content: btoa(unescape(encodeURIComponent(JSON.stringify(newVersionInfo, null, 2)))),
@@ -550,203 +436,174 @@ function App() {
         })
       })
       
-      if (!versionRes.ok) {
-        const err = await versionRes.json()
-        throw new Error(err.message || 'Failed to update version file')
-      }
-      
       setVersion(newVersionInfo)
       setHasChanges(false)
       setPublishOpen(false)
-      alert(`✅ Опубликовано! Новая версия: ${newVersion}`)
-      
+      alert(`✅ Опубликовано! v${newVersion}`)
     } catch (err) {
-      alert(`❌ Ошибка: ${err instanceof Error ? err.message : 'Unknown error'}`)
+      alert(`❌ Ошибка: ${err instanceof Error ? err.message : 'Unknown'}`)
     } finally {
       setPublishing(false)
     }
   }
 
+  const saveToken = (t: string) => {
+    setGithubToken(t)
+    localStorage.setItem('github_token', t)
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
-        <div className="text-xl">Загрузка словаря...</div>
-      </div>
-    )
-  }
-
-  if (error) {
-    return (
-      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center gap-4">
-        <div className="text-xl text-red-400">Ошибка: {error}</div>
-        <button 
-          onClick={loadDictionary}
-          className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
-        >
-          Повторить
-        </button>
+        <div className="text-xl">⏳ Загрузка...</div>
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
-      {/* Bulk Add Modal */}
-      <Modal isOpen={bulkAddOpen} onClose={() => setBulkAddOpen(false)} title="📝 Массовое добавление">
-        <p className="text-gray-400 mb-4">Вставьте слова (каждое с новой строки):</p>
-        <textarea
-          value={bulkText}
-          onChange={e => setBulkText(e.target.value)}
-          placeholder="Слово 1&#10;Слово 2&#10;Слово 3&#10;..."
-          className="w-full h-64 px-4 py-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none resize-none"
-        />
-        <div className="flex justify-between items-center mt-4">
-          <span className="text-sm text-gray-400">
-            {bulkText.split('\n').filter(w => w.trim()).length} слов
-          </span>
+    <div className="min-h-screen bg-gray-900 text-white flex flex-col">
+      {/* Add Category Modal */}
+      <Modal isOpen={addCategoryOpen} onClose={() => setAddCategoryOpen(false)} title="➕ Новая категория">
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Название</label>
+            <input
+              value={newCategory.name}
+              onChange={e => setNewCategory({ ...newCategory, name: e.target.value })}
+              placeholder="Party Games"
+              className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Emoji</label>
+            <input
+              value={newCategory.emoji}
+              onChange={e => setNewCategory({ ...newCategory, emoji: e.target.value })}
+              className="w-20 px-3 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none text-center text-2xl"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Жесть от</label>
+              <input
+                type="number" min={1} max={10}
+                value={newCategory.intensityMin}
+                onChange={e => setNewCategory({ ...newCategory, intensityMin: Number(e.target.value) })}
+                className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600"
+              />
+              <div className="text-xs text-gray-500 mt-1">{INTENSITY_LABELS[newCategory.intensityMin]}</div>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Жесть до</label>
+              <input
+                type="number" min={1} max={10}
+                value={newCategory.intensityMax}
+                onChange={e => setNewCategory({ ...newCategory, intensityMax: Number(e.target.value) })}
+                className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600"
+              />
+              <div className="text-xs text-gray-500 mt-1">{INTENSITY_LABELS[newCategory.intensityMax]}</div>
+            </div>
+          </div>
           <button
-            onClick={bulkAddWords}
-            className="px-6 py-2 bg-green-600 rounded hover:bg-green-700 font-medium"
+            onClick={handleAddCategory}
+            disabled={!newCategory.name}
+            className="w-full py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 rounded font-medium"
           >
-            ➕ Добавить все
+            Создать категорию
           </button>
         </div>
       </Modal>
 
-      {/* Add Category Modal */}
-      <Modal isOpen={addCategoryOpen} onClose={() => setAddCategoryOpen(false)} title="📁 Новая категория">
-        <p className="text-gray-400 mb-4">Введите название категории:</p>
-        <input
-          type="text"
-          value={newCategoryName}
-          onChange={e => setNewCategoryName(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && addCategory()}
-          placeholder="Название категории..."
-          className="w-full px-4 py-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
-        />
-        <button
-          onClick={addCategory}
-          disabled={!newCategoryName.trim()}
-          className="w-full mt-4 px-6 py-2 bg-purple-600 rounded hover:bg-purple-700 font-medium disabled:opacity-50"
-        >
-          ➕ Создать категорию
-        </button>
-      </Modal>
-
-      {/* Copy From Language Modal */}
-      <Modal isOpen={copyFromLangOpen} onClose={() => setCopyFromLangOpen(false)} title="🔄 Копировать из языка">
-        <p className="text-gray-400 mb-4">Выберите язык-источник для копирования слов:</p>
-        <div className="grid grid-cols-2 gap-3">
-          {LANGUAGES.filter(l => l.code !== language).map(lang => {
-            const wordCount = dictionary?.[lang.code]?.[category]?.length || 0
-            return (
-              <button
-                key={lang.code}
-                onClick={() => copyFromLanguage(lang.code)}
-                disabled={wordCount === 0}
-                className="p-4 bg-gray-700 rounded hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed text-left"
-              >
-                <div className="text-2xl mb-1">{lang.flag}</div>
-                <div className="font-medium">{lang.name}</div>
-                <div className="text-sm text-gray-400">{wordCount} слов</div>
-              </button>
-            )
-          })}
+      {/* Add Word Modal */}
+      <Modal isOpen={addWordOpen} onClose={() => setAddWordOpen(false)} title="➕ Добавить слово">
+        <div className="space-y-3">
+          {LANGUAGES.map(lang => (
+            <div key={lang.code}>
+              <label className="block text-sm text-gray-400 mb-1">{lang.flag} {lang.name}</label>
+              <input
+                value={newWord[lang.code]}
+                onChange={e => setNewWord({ ...newWord, [lang.code]: e.target.value })}
+                placeholder={lang.code === 'ru' ? 'Обязательно' : 'Необязательно'}
+                className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+          ))}
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">Жесть (1-10)</label>
+            <div className="flex items-center gap-3">
+              <input
+                type="range" min={1} max={10}
+                value={newWord.intensity}
+                onChange={e => setNewWord({ ...newWord, intensity: Number(e.target.value) })}
+                className="flex-1"
+              />
+              <span className="w-8 text-center font-bold">{newWord.intensity}</span>
+            </div>
+            <div className="text-xs text-gray-500">{INTENSITY_LABELS[newWord.intensity]}</div>
+          </div>
+          <button
+            onClick={handleAddWord}
+            disabled={!newWord.ru}
+            className="w-full py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded font-medium"
+          >
+            Добавить
+          </button>
         </div>
       </Modal>
 
-      {/* Publish to GitHub Modal */}
-      <Modal isOpen={publishOpen} onClose={() => setPublishOpen(false)} title="📤 Опубликовать в GitHub">
+      {/* Publish Modal */}
+      <Modal isOpen={publishOpen} onClose={() => setPublishOpen(false)} title="📤 Опубликовать">
         <div className="space-y-4">
+          <p className="text-gray-400">Обновить <strong>{variant === 'adult' ? 'Adult' : 'Family'}</strong> словарь</p>
           <div>
-            <p className="text-gray-400 mb-2">
-              Это обновит словарь <strong>{variant === 'adult' ? 'Adult (18+)' : 'Family'}</strong> в репозитории:
-            </p>
-            <a 
-              href={`https://github.com/${GITHUB_REPO}`} 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="text-blue-400 hover:underline"
-            >
-              github.com/{GITHUB_REPO}
-            </a>
-          </div>
-          
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">GitHub Token:</label>
+            <label className="block text-sm text-gray-400 mb-1">GitHub Token</label>
             <input
               type="password"
               value={githubToken}
-              onChange={e => saveGithubToken(e.target.value)}
-              placeholder="ghp_xxxxxxxxxxxx"
-              className="w-full px-4 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
+              onChange={e => saveToken(e.target.value)}
+              placeholder="ghp_..."
+              className="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600"
             />
             <p className="text-xs text-gray-500 mt-1">
-              Создать токен: <a href="https://github.com/settings/tokens/new?scopes=repo" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">github.com/settings/tokens</a> (нужен scope: repo)
+              <a href="https://github.com/settings/tokens/new?scopes=repo" target="_blank" className="text-blue-400">Создать токен</a>
             </p>
           </div>
-          
           {version && (
-            <div className="bg-gray-700 rounded p-3">
-              <div className="text-sm text-gray-400">Текущая версия:</div>
-              <div className="font-mono">{version.version} ({version.updatedAt})</div>
-              <div className="text-sm text-gray-400 mt-2">Новая версия:</div>
-              <div className="font-mono text-green-400">
+            <div className="bg-gray-700 p-3 rounded text-sm">
+              <div>Текущая: <span className="font-mono">{version.version}</span></div>
+              <div>Новая: <span className="font-mono text-green-400">
                 {version.version.split('.').map((v, i) => i === 2 ? Number(v) + 1 : v).join('.')}
-              </div>
+              </span></div>
             </div>
           )}
-          
           <button
             onClick={publishToGithub}
             disabled={!githubToken || publishing}
-            className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded font-medium flex items-center justify-center gap-2"
+            className="w-full py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded font-medium"
           >
-            {publishing ? (
-              <>⏳ Публикация...</>
-            ) : (
-              <>🚀 Опубликовать</>
-            )}
+            {publishing ? '⏳ Публикация...' : '🚀 Опубликовать'}
           </button>
         </div>
       </Modal>
 
       {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 p-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between flex-wrap gap-4">
-          <div className="flex items-center gap-4">
-            <h1 className="text-2xl font-bold">🎯 GuessUs Editor</h1>
-            {version && (
-              <span className="text-sm text-gray-400">
-                v{version.version}
-              </span>
-            )}
+      <header className="bg-gray-800 border-b border-gray-700 p-3 flex-shrink-0">
+        <div className="max-w-[1600px] mx-auto flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-bold">🎯 GuessUs Editor</h1>
+            {version && <span className="text-sm text-gray-400">v{version.version}</span>}
+            {hasChanges && <span className="text-yellow-400 text-sm">● изменения</span>}
           </div>
-          
-          <div className="flex items-center gap-2 flex-wrap">
-            {hasChanges && (
-              <span className="text-yellow-400 text-sm">● Изменения</span>
-            )}
-            <label className="px-3 py-1.5 bg-gray-700 rounded hover:bg-gray-600 text-sm cursor-pointer">
-              📁 Импорт
-              <input type="file" accept=".json" onChange={importFromFile} className="hidden" />
-            </label>
-            <button
-              onClick={copyToClipboard}
-              className="px-3 py-1.5 bg-gray-700 rounded hover:bg-gray-600 text-sm"
-            >
-              📋 Копировать
+          <div className="flex items-center gap-2">
+            <button onClick={loadDictionary} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+              🔄 Обновить
             </button>
-            <button
-              onClick={exportJson}
-              className="px-3 py-1.5 bg-blue-600 rounded hover:bg-blue-700 text-sm"
-            >
+            <button onClick={exportJson} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">
               💾 Скачать
             </button>
-            <button
-              onClick={() => setPublishOpen(true)}
-              disabled={!hasChanges}
-              className="px-3 py-1.5 bg-green-600 rounded hover:bg-green-700 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            <button 
+              onClick={() => setPublishOpen(true)} 
+              className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded text-sm"
             >
               📤 Опубликовать
             </button>
@@ -754,88 +611,57 @@ function App() {
         </div>
       </header>
 
-      <div className="max-w-7xl mx-auto p-4 flex gap-4 flex-col lg:flex-row">
+      <div className="flex-1 flex overflow-hidden">
         {/* Sidebar */}
-        <aside className="lg:w-64 flex-shrink-0 space-y-4">
-          {/* Variant selector */}
-          <div className="bg-gray-800 rounded-lg p-4">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">Вариант</h3>
+        <aside className="w-64 bg-gray-800 border-r border-gray-700 flex flex-col overflow-hidden flex-shrink-0">
+          {/* Variant */}
+          <div className="p-3 border-b border-gray-700">
             <div className="flex gap-2">
               <button
                 onClick={() => setVariant('adult')}
-                className={`flex-1 py-2 rounded text-sm font-medium transition ${
-                  variant === 'adult' 
-                    ? 'bg-red-600 text-white' 
-                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                }`}
+                className={`flex-1 py-2 rounded text-sm font-medium ${variant === 'adult' ? 'bg-red-600' : 'bg-gray-700 hover:bg-gray-600'}`}
               >
                 🔞 Adult
               </button>
               <button
                 onClick={() => setVariant('family')}
-                className={`flex-1 py-2 rounded text-sm font-medium transition ${
-                  variant === 'family' 
-                    ? 'bg-green-600 text-white' 
-                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                }`}
+                className={`flex-1 py-2 rounded text-sm font-medium ${variant === 'family' ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'}`}
               >
                 👨‍👩‍👧 Family
               </button>
             </div>
           </div>
 
-          {/* Language selector */}
-          <div className="bg-gray-800 rounded-lg p-4">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">Язык</h3>
-            <div className="grid grid-cols-2 gap-2">
-              {LANGUAGES.map(lang => (
-                <button
-                  key={lang.code}
-                  onClick={() => setLanguage(lang.code)}
-                  className={`py-2 rounded text-sm font-medium transition ${
-                    language === lang.code
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                  }`}
-                >
-                  {lang.flag} {lang.code.toUpperCase()}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Category selector */}
-          <div className="bg-gray-800 rounded-lg p-4">
+          {/* Categories */}
+          <div className="flex-1 overflow-y-auto p-3">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold text-gray-400">Категория</h3>
+              <span className="text-sm text-gray-400 font-medium">Категории</span>
               <button
                 onClick={() => setAddCategoryOpen(true)}
-                className="text-xs bg-purple-600 px-2 py-1 rounded hover:bg-purple-700"
+                className="text-xs bg-purple-600 hover:bg-purple-700 px-2 py-1 rounded"
               >
                 + Новая
               </button>
             </div>
             <div className="space-y-1">
-              {allCategories.map(cat => (
-                <div key={cat.code} className="flex items-center gap-1">
+              {data?.categories.map(cat => (
+                <div key={cat.id} className="flex items-center gap-1">
                   <button
-                    onClick={() => setCategory(cat.code)}
-                    className={`flex-1 py-2 px-3 rounded text-sm font-medium text-left transition flex items-center justify-between ${
-                      category === cat.code
-                        ? 'bg-purple-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    onClick={() => setSelectedCategory(cat.id)}
+                    className={`flex-1 py-2 px-3 rounded text-sm text-left flex items-center justify-between ${
+                      selectedCategory === cat.id ? 'bg-purple-600' : 'bg-gray-700 hover:bg-gray-600'
                     }`}
                   >
                     <span>{cat.emoji} {cat.name}</span>
-                    <span className="text-xs opacity-75">
-                      {dictionary?.[language]?.[cat.code]?.length || 0}
+                    <span className="text-xs opacity-60">
+                      {data.words[cat.id]?.length || 0}
                     </span>
                   </button>
-                  {customCategories.includes(cat.code) && (
+                  {!DEFAULT_ADULT_CATEGORIES.find(c => c.id === cat.id) && 
+                   !DEFAULT_FAMILY_CATEGORIES.find(c => c.id === cat.id) && (
                     <button
-                      onClick={() => deleteCategory(cat.code)}
-                      className="p-2 text-red-400 hover:text-red-300 hover:bg-gray-700 rounded"
-                      title="Удалить категорию"
+                      onClick={() => handleDeleteCategory(cat.id)}
+                      className="p-2 text-red-400 hover:bg-gray-700 rounded"
                     >
                       🗑️
                     </button>
@@ -847,177 +673,166 @@ function App() {
 
           {/* Stats */}
           {stats && (
-            <div className="bg-gray-800 rounded-lg p-4">
-              <h3 className="text-sm font-semibold text-gray-400 mb-2">Статистика</h3>
-              <div className="text-2xl font-bold text-blue-400 mb-2">{stats.total} слов</div>
-              <div className="space-y-1 text-sm">
-                {LANGUAGES.map(lang => (
-                  <div key={lang.code} className="flex justify-between text-gray-400">
-                    <span>{lang.flag} {lang.name}</span>
-                    <span>{stats.byLanguage[lang.code]}</span>
-                  </div>
+            <div className="p-3 border-t border-gray-700 text-sm">
+              <div className="text-2xl font-bold text-blue-400 mb-1">{stats.total}</div>
+              <div className="text-gray-400 text-xs">слов всего</div>
+              <div className="grid grid-cols-2 gap-1 mt-2 text-xs text-gray-500">
+                {LANGUAGES.map(l => (
+                  <div key={l.code}>{l.flag} {stats.byLang[l.code]}</div>
                 ))}
               </div>
             </div>
           )}
-
-          {/* Magic buttons */}
-          <div className="bg-gray-800 rounded-lg p-4 space-y-2">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">🪄 Волшебные кнопки</h3>
-            
-            <button
-              onClick={() => setBulkAddOpen(true)}
-              className="w-full py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium"
-            >
-              📝 Массовое добавление
-            </button>
-            
-            <button
-              onClick={() => setCopyFromLangOpen(true)}
-              className="w-full py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium"
-            >
-              🔄 Копировать из языка
-            </button>
-            
-            {duplicates.size > 0 && (
-              <button
-                onClick={removeDuplicates}
-                className="w-full py-2 bg-yellow-600 hover:bg-yellow-700 rounded text-sm font-medium"
-              >
-                🗑️ Удалить дубликаты ({duplicates.size})
-              </button>
-            )}
-            
-            <button
-              onClick={removeAllDuplicates}
-              className="w-full py-2 bg-red-600 hover:bg-red-700 rounded text-sm font-medium"
-            >
-              🧹 Удалить ВСЕ дубликаты
-            </button>
-          </div>
         </aside>
 
-        {/* Main content */}
-        <main className="flex-1">
-          {/* Search and add */}
-          <div className="bg-gray-800 rounded-lg p-4 mb-4">
-            <div className="flex gap-4 flex-wrap">
-              <div className="flex-1 min-w-[200px]">
-                <input
-                  type="text"
-                  placeholder="🔍 Поиск слов..."
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                  className="w-full px-4 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
-                />
-              </div>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Новое слово..."
-                  value={newWord}
-                  onChange={e => setNewWord(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && addWord()}
-                  className="px-4 py-2 bg-gray-700 rounded border border-gray-600 focus:border-green-500 focus:outline-none"
-                />
-                <button
-                  onClick={addWord}
-                  disabled={!newWord.trim()}
-                  className="px-4 py-2 bg-green-600 rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  ➕
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Words header */}
-          <div className="flex items-center justify-between mb-2 px-2">
-            <h2 className="text-lg font-semibold">
-              {LANGUAGES.find(l => l.code === language)?.flag}{' '}
-              {allCategories.find(c => c.code === category)?.emoji}{' '}
-              {allCategories.find(c => c.code === category)?.name}
-            </h2>
-            <span className="text-gray-400 text-sm">
-              {filteredWords.length} из {currentWords.length} слов
-            </span>
-          </div>
-
-          {/* Words grid */}
-          <div className="bg-gray-800 rounded-lg p-4">
-            {filteredWords.length === 0 ? (
-              <div className="text-center text-gray-400 py-8">
-                {searchQuery ? 'Ничего не найдено' : 'Нет слов в этой категории'}
-                <div className="mt-4">
-                  <button
-                    onClick={() => setBulkAddOpen(true)}
-                    className="px-4 py-2 bg-green-600 rounded hover:bg-green-700"
-                  >
-                    📝 Добавить слова
-                  </button>
+        {/* Main */}
+        <main className="flex-1 flex flex-col overflow-hidden">
+          {/* Toolbar */}
+          <div className="p-3 border-b border-gray-700 flex items-center gap-3 flex-wrap bg-gray-800/50">
+            {currentCategory && (
+              <div className="flex items-center gap-2">
+                <span className="text-2xl">{currentCategory.emoji}</span>
+                <div>
+                  <div className="font-medium">{currentCategory.name}</div>
+                  <div className="text-xs text-gray-400">
+                    Жесть: {currentCategory.intensityMin}-{currentCategory.intensityMax}
+                  </div>
                 </div>
               </div>
-            ) : (
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-                {filteredWords.map((word, idx) => {
-                  const realIndex = currentWords.indexOf(word)
-                  const isDuplicate = duplicates.has(realIndex)
-                  
-                  return (
-                    <div
-                      key={`${word}-${idx}`}
-                      className={`group relative p-2 rounded text-sm transition ${
-                        isDuplicate 
-                          ? 'bg-yellow-900/50 border border-yellow-600' 
-                          : 'bg-gray-700 hover:bg-gray-600'
-                      }`}
-                    >
-                      {editingIndex === realIndex ? (
-                        <div className="flex gap-1">
-                          <input
-                            type="text"
-                            value={editingValue}
-                            onChange={e => setEditingValue(e.target.value)}
-                            onKeyDown={e => {
-                              if (e.key === 'Enter') saveEdit()
-                              if (e.key === 'Escape') setEditingIndex(null)
-                            }}
-                            autoFocus
-                            className="flex-1 px-2 py-1 bg-gray-800 rounded text-sm border border-blue-500 focus:outline-none"
-                          />
-                          <button
-                            onClick={saveEdit}
-                            className="px-2 py-1 bg-green-600 rounded text-xs hover:bg-green-700"
-                          >
-                            ✓
-                          </button>
-                        </div>
-                      ) : (
-                        <>
-                          <span className="block truncate pr-12">{word}</span>
-                          <div className="absolute right-1 top-1 opacity-0 group-hover:opacity-100 flex gap-1">
-                            <button
-                              onClick={() => startEdit(realIndex)}
-                              className="p-1 bg-blue-600 rounded text-xs hover:bg-blue-700"
-                              title="Редактировать"
-                            >
-                              ✏️
-                            </button>
-                            <button
-                              onClick={() => deleteWord(realIndex)}
-                              className="p-1 bg-red-600 rounded text-xs hover:bg-red-700"
-                              title="Удалить"
-                            >
-                              🗑️
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
             )}
+            
+            <div className="flex-1" />
+            
+            <input
+              type="text"
+              placeholder="🔍 Поиск..."
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className="px-3 py-1.5 bg-gray-700 rounded border border-gray-600 text-sm w-48"
+            />
+            
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-gray-400">Жесть:</span>
+              <input
+                type="number" min={1} max={10}
+                value={intensityFilter[0]}
+                onChange={e => setIntensityFilter([Number(e.target.value), intensityFilter[1]])}
+                className="w-12 px-2 py-1 bg-gray-700 rounded border border-gray-600 text-center"
+              />
+              <span>-</span>
+              <input
+                type="number" min={1} max={10}
+                value={intensityFilter[1]}
+                onChange={e => setIntensityFilter([intensityFilter[0], Number(e.target.value)])}
+                className="w-12 px-2 py-1 bg-gray-700 rounded border border-gray-600 text-center"
+              />
+            </div>
+            
+            <button
+              onClick={() => {
+                setNewWord({ ru: '', en: '', es: '', ua: '', intensity: currentCategory?.intensityMin || 5 })
+                setAddWordOpen(true)
+              }}
+              className="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded text-sm"
+            >
+              ➕ Добавить слово
+            </button>
+          </div>
+
+          {/* Table */}
+          <div className="flex-1 overflow-auto p-3">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-gray-800">
+                <tr className="border-b border-gray-700">
+                  <th className="text-left py-2 px-3 w-12">#</th>
+                  {LANGUAGES.map(l => (
+                    <th key={l.code} className="text-left py-2 px-3">{l.flag} {l.name}</th>
+                  ))}
+                  <th className="text-center py-2 px-3 w-20">Жесть</th>
+                  <th className="w-12"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {currentWords.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="text-center py-12 text-gray-500">
+                      {searchQuery ? 'Ничего не найдено' : 'Нет слов в категории'}
+                      <div className="mt-2">
+                        <button
+                          onClick={() => setAddWordOpen(true)}
+                          className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded"
+                        >
+                          ➕ Добавить слово
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  currentWords.map((word, idx) => (
+                    <tr key={idx} className="border-b border-gray-700/50 hover:bg-gray-800/50">
+                      <td className="py-1 px-3 text-gray-500">{idx + 1}</td>
+                      {LANGUAGES.map(l => (
+                        <td key={l.code} className="py-1 px-3">
+                          {editingCell?.wordIdx === idx && editingCell?.field === l.code ? (
+                            <input
+                              autoFocus
+                              value={editValue}
+                              onChange={e => setEditValue(e.target.value)}
+                              onBlur={saveEdit}
+                              onKeyDown={e => e.key === 'Enter' && saveEdit()}
+                              className="w-full px-2 py-1 bg-gray-700 rounded border border-blue-500"
+                            />
+                          ) : (
+                            <span
+                              onClick={() => startEdit(idx, l.code)}
+                              className={`cursor-pointer hover:bg-gray-700 px-2 py-1 rounded block ${!word[l.code] ? 'text-gray-600 italic' : ''}`}
+                            >
+                              {word[l.code] || '—'}
+                            </span>
+                          )}
+                        </td>
+                      ))}
+                      <td className="py-1 px-3 text-center">
+                        {editingCell?.wordIdx === idx && editingCell?.field === 'intensity' ? (
+                          <input
+                            autoFocus
+                            type="number" min={1} max={10}
+                            value={editValue}
+                            onChange={e => setEditValue(e.target.value)}
+                            onBlur={saveEdit}
+                            onKeyDown={e => e.key === 'Enter' && saveEdit()}
+                            className="w-12 px-2 py-1 bg-gray-700 rounded border border-blue-500 text-center"
+                          />
+                        ) : (
+                          <span
+                            onClick={() => startEdit(idx, 'intensity')}
+                            className={`cursor-pointer hover:bg-gray-700 px-2 py-1 rounded inline-block ${
+                              word.intensity >= 8 ? 'text-red-400' : 
+                              word.intensity >= 5 ? 'text-yellow-400' : 'text-green-400'
+                            }`}
+                          >
+                            {word.intensity}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-1 px-3">
+                        <button
+                          onClick={() => handleDeleteWord(idx)}
+                          className="text-red-400 hover:text-red-300 p-1"
+                        >
+                          🗑️
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Footer info */}
+          <div className="p-2 border-t border-gray-700 text-xs text-gray-500 text-center bg-gray-800/50">
+            💡 Кликните на ячейку для редактирования • Напишите боту для генерации слов AI
           </div>
         </main>
       </div>
